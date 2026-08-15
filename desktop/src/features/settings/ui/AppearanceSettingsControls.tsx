@@ -43,7 +43,7 @@ import {
 
 import { Switch } from "@/shared/ui/switch";
 import { SettingsOptionRow } from "./SettingsOptionGroup";
-import { SettingsSegmentedControl } from "./SettingsSegmentedControl";
+import { SegmentedControl } from "@/shared/ui/segmented-control";
 
 /** Buzz navigation can use either its production tint or a stronger tab. */
 export function ProminentActiveTabSetting() {
@@ -214,11 +214,11 @@ export function ConversationDisplaySettings() {
             className="text-sm font-normal text-muted-foreground/70"
             data-settings-subcopy
           >
-            Applies to all text, not just messages
+            Applies across conversations and interface text
           </p>
         </div>
-        <SettingsSegmentedControl
-          className="w-72"
+        <SegmentedControl
+          size="wide"
           legend="Font size"
           onPreviewChange={previewFontSize}
           onValueChange={setFontSize}
@@ -235,11 +235,11 @@ export function ConversationDisplaySettings() {
             className="text-sm font-normal text-muted-foreground/70"
             data-settings-subcopy
           >
-            Spacing in channels, threads, DMs, and Inbox
+            Spacing in conversations and Markdown content across Buzz
           </p>
         </div>
-        <SettingsSegmentedControl
-          className="w-72"
+        <SegmentedControl
+          size="wide"
           legend="Conversation density"
           onPreviewChange={previewConversationDensity}
           onValueChange={setConversationDensity}
@@ -350,8 +350,8 @@ export function LinkPreviewStyleSetting() {
             {activeOption.description}
           </p>
         </div>
-        <SettingsSegmentedControl
-          className="w-48"
+        <SegmentedControl
+          size="compact"
           legend="Link previews"
           onPreviewChange={previewLinkPreviewStyle}
           onValueChange={setLinkPreviewStyle}
@@ -624,8 +624,8 @@ export function ThreadLayoutSetting() {
             {activeOption.description}
           </p>
         </div>
-        <SettingsSegmentedControl
-          className="w-48"
+        <SegmentedControl
+          size="compact"
           legend="Thread layout"
           onPreviewChange={previewThreadViewMode}
           onValueChange={setThreadViewMode}

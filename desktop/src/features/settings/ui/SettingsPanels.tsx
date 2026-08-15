@@ -71,7 +71,7 @@ import { NotificationSettingsCard } from "./NotificationSettingsCard";
 import { AgentsSettingsPanel } from "./AgentsSettingsPanel";
 import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
-import { SettingsSegmentedControl } from "./SettingsSegmentedControl";
+import { SegmentedControl } from "@/shared/ui/segmented-control";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
@@ -672,7 +672,7 @@ function ThemeSettingsCard() {
                 Follow your system or choose a light or dark appearance.
               </p>
             </div>
-            <SettingsSegmentedControl
+            <SegmentedControl
               indicatorTestId="appearance-color-mode-indicator"
               legend="Color mode"
               onValueChange={handleModeSelect}

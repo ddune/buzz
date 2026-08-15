@@ -19,6 +19,7 @@ export function SettingsOptionGroup({
   return (
     <div
       className={cn(
+        "[container-type:inline-size]",
         surface === "soft"
           ? "overflow-hidden rounded-2xl bg-muted/20"
           : "overflow-hidden rounded-xl border border-border/70 bg-background/70 divide-y divide-border/55",
@@ -54,7 +55,7 @@ export function SettingsOptionRow({
   return (
     <div
       className={cn(
-        "flex min-h-16 items-center justify-between gap-4 px-4 py-3 text-sm",
+        "flex min-h-16 items-center justify-between gap-4 px-4 py-3 text-sm [@container(max-width:34rem)]:flex-col [@container(max-width:34rem)]:items-start [@container(max-width:34rem)]:[&>[data-slot=segmented-control]]:w-full",
         className,
       )}
       {...props}

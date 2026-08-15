@@ -182,7 +182,7 @@ export function InboxMessageRow({
           </div>
         )}
 
-        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div className="flex min-w-0 flex-1 flex-col">
           {isContinuation ? null : (
             <MessageHeaderRow className="gap-x-2">
               <UserProfilePopover
@@ -210,7 +210,10 @@ export function InboxMessageRow({
             </MessageHeaderRow>
           )}
 
-          <div className={isContinuation ? "mt-0" : "mt-conversation-body"}>
+          <div
+            className={isContinuation ? "mt-0" : "mt-conversation-body"}
+            data-testid="message-body"
+          >
             <Markdown
               className={cn(
                 "max-w-full text-left text-message text-foreground",

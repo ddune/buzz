@@ -2180,7 +2180,7 @@ test("supports webview zoom keyboard shortcuts", async ({ page }) => {
 
   await expect.poll(getTextScaleState).toEqual({
     rootFontSize: "16px",
-    textRemSize: "18.857143px",
+    textRemSize: "17.6px",
     storedScale: "1.1",
     webviewZoom: 1,
   });
@@ -2189,7 +2189,7 @@ test("supports webview zoom keyboard shortcuts", async ({ page }) => {
 
   await expect.poll(getTextScaleState).toEqual({
     rootFontSize: "16px",
-    textRemSize: "17.142857px",
+    textRemSize: "16px",
     storedScale: null,
     webviewZoom: 1,
   });
@@ -2199,7 +2199,7 @@ test("supports webview zoom keyboard shortcuts", async ({ page }) => {
 
   await expect.poll(getTextScaleState).toEqual({
     rootFontSize: "16px",
-    textRemSize: "20.571429px",
+    textRemSize: "19.2px",
     storedScale: "1.2",
     webviewZoom: 1,
   });
@@ -2208,7 +2208,7 @@ test("supports webview zoom keyboard shortcuts", async ({ page }) => {
 
   await expect.poll(getTextScaleState).toEqual({
     rootFontSize: "16px",
-    textRemSize: "17.142857px",
+    textRemSize: "16px",
     storedScale: null,
     webviewZoom: 1,
   });

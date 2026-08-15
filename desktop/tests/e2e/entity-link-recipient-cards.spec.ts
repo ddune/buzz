@@ -113,7 +113,7 @@ test("agent-style message with bare buzz:// links renders entity cards without s
   await expect(
     repoCard.locator("[data-link-preview-hostname-favicon]"),
   ).toHaveCount(0);
-  // Default typography is 15px; keep the image-less card compact while
+  // Default typography is 14px; keep the image-less card compact while
   // allowing fractional line-height rounding across rendering platforms.
   expect(
     await repoCard.evaluate((card) => card.getBoundingClientRect().height),
