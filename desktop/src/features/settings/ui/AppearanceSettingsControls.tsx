@@ -14,6 +14,7 @@ import {
   useLinkPreviewStyle,
   type LinkPreviewStyle,
 } from "@/shared/lib/linkPreviewStylePreference";
+import { isLinuxPlatform } from "@/shared/lib/platform";
 import {
   previewConversationDensity,
   setConversationDensity,
@@ -345,6 +346,9 @@ export function GlassBackgroundSetting() {
     setGlassOpacity,
   } = useTheme();
   const shouldReduceMotion = useReducedMotion();
+
+  if (isLinuxPlatform()) return null;
+
   const shouldShowOpacity = glassBackgroundSupported && glassBackground;
   const opacityRow = (
     <SettingsOptionRow data-testid="glass-opacity-row">

@@ -70,7 +70,11 @@ import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
 import { AgentsSettingsPanel } from "./AgentsSettingsPanel";
 import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
-import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
+import {
+  SettingsOptionGroup,
+  SettingsOptionGroupList,
+  SettingsOptionRow,
+} from "./SettingsOptionGroup";
 import { SegmentedControl } from "@/shared/ui/segmented-control";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
@@ -397,9 +401,9 @@ function SingleThemeTile({
 type AppearanceMode = "system" | "light" | "dark";
 
 const APPEARANCE_MODE_OPTIONS = [
-  { value: "system" as const, label: "System", Icon: SunMoon },
-  { value: "light" as const, label: "Light", Icon: Sun },
-  { value: "dark" as const, label: "Dark", Icon: Moon },
+  { mode: "system" as const, label: "System", Icon: SunMoon },
+  { mode: "light" as const, label: "Light", Icon: Sun },
+  { mode: "dark" as const, label: "Dark", Icon: Moon },
 ] as const;
 
 // Reveal/hide motion for the accent picker: a small translate + opacity fade.
@@ -637,7 +641,7 @@ function ThemeSettingsCard() {
         description="Choose how Buzz looks and feels."
       />
 
-      <div className="space-y-12">
+      <SettingsOptionGroupList>
         <SettingsOptionGroup
           data-testid="appearance-theme-card"
           headerAction={
@@ -677,7 +681,11 @@ function ThemeSettingsCard() {
               legend="Color mode"
               onValueChange={handleModeSelect}
               optionTestIdPrefix="appearance-mode"
-              options={APPEARANCE_MODE_OPTIONS}
+              options={APPEARANCE_MODE_OPTIONS.map(({ mode, label, Icon }) => ({
+                value: mode,
+                label,
+                Icon,
+              }))}
               testId="appearance-color-mode-control"
               value={selectedMode}
             />
@@ -786,7 +794,7 @@ function ThemeSettingsCard() {
           <LinkPreviewStyleSetting />
           <ThreadLayoutSetting />
         </SettingsOptionGroup>
-      </div>
+      </SettingsOptionGroupList>
     </section>
   );
 }

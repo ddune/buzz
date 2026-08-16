@@ -8,12 +8,13 @@ import {
   type InboxTypeLabel,
 } from "@/features/home/lib/inbox";
 import { buildInboxListRows } from "@/features/home/lib/inboxListRows";
+import { hasRenderedVideoAttachment } from "@/features/messages/lib/videoReviewContext";
+import { getThreadReference } from "@/features/messages/lib/threading";
 import { InboxFilterMenu } from "@/features/home/ui/InboxFilterMenu";
 import {
   DraftsPanel,
   type DraftViewItem,
 } from "@/features/messages/ui/DraftsPanel";
-import { MessageAuthorText } from "@/features/messages/ui/MessageHeader";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import type { Reminder } from "@/features/reminders/lib/reminderTypes";
 import { isDue } from "@/features/reminders/lib/reminderFilters";
@@ -31,7 +32,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/shared/ui/context-menu";
-import { Markdown } from "@/shared/ui/markdown";
+import { VideoReviewCommentMarkdown } from "@/shared/ui/VideoReviewCommentMarkdown";
 import {
   MENTION_CHIP_BASE_CLASSES,
   MESSAGE_MARKDOWN_CLASS,
@@ -120,6 +121,34 @@ function formatReminderStatus(notBefore: number | undefined) {
     return `Reminder in ${Math.floor(secondsUntil / 3_600)}h`;
   }
   return `Reminder in ${Math.floor(secondsUntil / 86_400)}d`;
+}
+
+function getInboxVideoReviewCommentRootId(item: InboxItem) {
+  const feedItems = [item.item, ...item.groupItems];
+  const feedItemById = new Map(
+    feedItems.map((feedItem) => [feedItem.id, feedItem]),
+  );
+  const videoMessageIds = new Set(
+    feedItems
+      .filter((feedItem) =>
+        hasRenderedVideoAttachment({
+          body: feedItem.content,
+          tags: feedItem.tags,
+        }),
+      )
+      .map((feedItem) => feedItem.id),
+  );
+  const visited = new Set<string>();
+  let ancestorId = getThreadReference(item.item.tags).parentId;
+
+  while (ancestorId && !visited.has(ancestorId)) {
+    if (videoMessageIds.has(ancestorId)) return ancestorId;
+    visited.add(ancestorId);
+    const ancestor = feedItemById.get(ancestorId);
+    ancestorId = ancestor ? getThreadReference(ancestor.tags).parentId : null;
+  }
+
+  return undefined;
 }
 
 function PersonalItemRow({
@@ -275,6 +304,7 @@ export function InboxListPane({
       );
     const hasChannelTarget = Boolean(item.item.channelId);
     const typeLabel = getInboxTypeLabel(item);
+    const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
     const isSenderAgent =
       agentPubkeys?.has(normalizePubkey(item.item.pubkey)) === true;
     const profileRole = isSenderAgent ? "bot" : undefined;
@@ -352,7 +382,7 @@ export function InboxListPane({
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-start gap-2">
                 <span
-                  className="flex min-w-0 flex-1 items-start leading-message-author"
+                  className="flex min-w-0 flex-1 items-start leading-4"
                   data-inbox-profile-trigger="true"
                 >
                   <UserProfilePopover
@@ -361,14 +391,14 @@ export function InboxListPane({
                     role={profileRole}
                     triggerElement="span"
                   >
-                    <MessageAuthorText className="block max-w-full">
+                    <span className="block max-w-full truncate rounded text-sm font-semibold leading-4 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
                       {item.senderLabel}
-                    </MessageAuthorText>
+                    </span>
                   </UserProfilePopover>
                 </span>
                 <span
                   className={cn(
-                    "flex shrink-0 items-center gap-1.5 text-message-timestamp text-muted-foreground/70 transition-opacity group-hover/inbox-item:opacity-0 group-focus-within/inbox-item:opacity-0",
+                    "flex shrink-0 items-center gap-1.5 text-xs leading-4 text-muted-foreground/70 transition-opacity group-hover/inbox-item:opacity-0 group-focus-within/inbox-item:opacity-0",
                     isDone ? "font-normal" : "font-medium",
                   )}
                 >
@@ -409,11 +439,12 @@ export function InboxListPane({
                     : "font-semibold text-foreground",
                 )}
               >
-                <Markdown
+                <VideoReviewCommentMarkdown
                   className="inbox-preview-markdown text-inherit"
                   content={item.preview}
                   interactive={false}
                   mentionNames={item.mentionNames}
+                  videoReviewCommentRootId={videoReviewCommentRootId}
                 />
               </div>
             </div>
