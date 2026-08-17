@@ -2,7 +2,8 @@
 //
 // One always-on harness that ring-buffers timing records and flushes JSONL to
 // `<app-data>/profiling/session-<ts>.jsonl`. Four probes:
-//   1. main-thread stalls (timer drift) + input latency (down → next paint)
+//   1. main-thread stalls (timer drift, foreground-only) + input latency
+//      (receipt → next paint, with pre-dispatch queue delay split out)
 //   2. Tauri IPC duration/outcome + a >10s pending-invoke watchdog (deadlocks)
 //   3. relay REQ→EOSE (history fetch) and publish send→ack round-trips
 //   4. periodic accumulator census (observer store, query cache, DOM nodes)
@@ -18,8 +19,8 @@ import { getObserverStoreCensus } from "@/features/agents/observerRelayStore";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   DRIFT_INTERVAL_MS,
-  DRIFT_THRESHOLD_MS,
-  computeDrift,
+  classifyInput,
+  nextStallSample,
 } from "@/shared/profiling/drift";
 import {
   FLUSH_INTERVAL_MS,
@@ -29,7 +30,6 @@ import {
 const CENSUS_INTERVAL_MS = 120_000;
 const PENDING_INVOKE_MS = 10_000;
 const PENDING_SCAN_MS = 5_000;
-const INPUT_LATENCY_MIN_MS = 100;
 
 // RelayClient methods whose resolution marks a REQ→EOSE round-trip (history
 // fetches resolve when the relay sends EOSE) versus a publish send→ack
@@ -137,35 +137,60 @@ function installIpcProbe(rec: ProfileRecorder): void {
   }, PENDING_SCAN_MS);
 }
 
+function isForeground(): boolean {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+
 function installStallProbe(rec: ProfileRecorder): void {
   let armedAt = performance.now();
+  // An interval only counts if the document stayed visible+focused for its
+  // whole span. Any blur/hide between arms taints the current interval so a
+  // background gap is never scored as a main-thread block.
+  let continuousForeground = isForeground();
+  const taint = () => {
+    continuousForeground = false;
+  };
+  document.addEventListener("visibilitychange", taint);
+  window.addEventListener("blur", taint);
   window.setInterval(() => {
     const observed = performance.now();
-    const drift = computeDrift(
-      observed,
-      armedAt + DRIFT_INTERVAL_MS,
-      DRIFT_THRESHOLD_MS,
-    );
-    if (drift !== null) {
-      rec.record({ type: "stall", dur: drift });
+    const eligible = continuousForeground && isForeground();
+    const sample = nextStallSample(armedAt, observed, eligible);
+    if (sample.dur !== null) {
+      rec.record({ type: "stall", dur: sample.dur });
     }
-    armedAt = observed;
+    armedAt = sample.armedAt;
+    // Re-arm cleanly: the next interval is continuous only if we are in the
+    // foreground right now.
+    continuousForeground = isForeground();
   }, DRIFT_INTERVAL_MS);
 }
 
 function installInputProbe(rec: ProfileRecorder): void {
   const onInput = (kind: "keydown" | "pointerdown") => (event: Event) => {
-    const start = event.timeStamp;
+    // Capture the harness's own receipt clock synchronously, in the listener,
+    // so `latency` is receipt → next painted frame on a single clock basis.
+    const receivedAt = performance.now();
+    const eventTimeStamp = event.timeStamp;
     requestAnimationFrame(() =>
       requestAnimationFrame(() => {
-        const latency = performance.now() - start;
-        if (latency >= INPUT_LATENCY_MIN_MS) {
-          rec.record({ type: "input", kind, latency });
+        const result = classifyInput(
+          eventTimeStamp,
+          receivedAt,
+          performance.now(),
+        );
+        if (result !== null) {
+          rec.record({
+            type: "input",
+            kind,
+            latency: result.latency,
+            queued: result.queued,
+          });
         }
       }),
     );
   };
-  // Capture phase so the timestamp precedes app handlers.
+  // Capture phase so the receipt clock precedes app handlers.
   window.addEventListener("keydown", onInput("keydown"), {
     capture: true,
     passive: true,

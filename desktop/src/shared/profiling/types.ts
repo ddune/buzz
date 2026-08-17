@@ -24,8 +24,14 @@ export type StallRecord = ProfileEnvelope & {
 export type InputRecord = ProfileEnvelope & {
   type: "input";
   kind: "keydown" | "pointerdown";
-  /** Event timestamp → next painted frame, ms. */
+  /** Capture-listener receipt → next painted frame, ms (single-clock). */
   latency: number;
+  /**
+   * Pre-dispatch delay: `event.timeStamp` → capture-listener receipt, ms.
+   * `null` when that delta is implausible (a cross-clock basis mismatch).
+   * Total felt latency is `latency + (queued ?? 0)`.
+   */
+  queued: number | null;
 };
 
 export type IpcRecord = ProfileEnvelope & {
