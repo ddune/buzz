@@ -61,6 +61,7 @@ import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChang
 import { setAvatarProfileSyncQueryClient } from "@/features/profile/avatarProfileSync";
 import { EncryptedBackupProvider } from "@/features/settings/EncryptedBackupProvider";
 import { createBuzzQueryClient } from "@/shared/api/queryClient";
+import { startProfilingHarness } from "@/shared/profiling/harness";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
 import { getProfile } from "@/shared/api/tauriProfiles";
 import {
@@ -214,6 +215,10 @@ function CommunityQueryProvider({ children }: { children: ReactNode }) {
   const [queryClient] = useState(createBuzzQueryClient);
 
   useEffect(() => setAvatarProfileSyncQueryClient(queryClient), [queryClient]);
+
+  // Temporary profiling harness (never merges): start once with a live
+  // QueryClient so the accumulator census can read the query cache.
+  useEffect(() => startProfilingHarness(queryClient), [queryClient]);
 
   useEffect(() => {
     const e2eWindow = window as Window & {
