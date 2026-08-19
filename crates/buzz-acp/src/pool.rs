@@ -67,6 +67,10 @@ pub struct TaskMeta {
     /// acceptance or rejection is a hard turn boundary: accepted work must
     /// resume only through a durably claimed execution continuation.
     pub job_evaluation: Option<crate::job_execution::JobEvaluationContext>,
+    /// Set only after the matching durable accept/reject event is observed.
+    /// Distinguishes a consumed proposal from an undecided failed turn that
+    /// must retain normal retry behavior.
+    pub job_evaluation_decided: bool,
     /// Clone of batch for Queue mode panic recovery.
     pub recoverable_batch: Option<FlushBatch>,
     /// Control signal for the in-flight prompt task.
@@ -1009,6 +1013,7 @@ struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
     id: Option<Uuid>,
     channel_type: Option<&'a str>,
+    job_evaluation: bool,
 }
 
 async fn create_session_and_apply_model(
@@ -1047,6 +1052,7 @@ async fn create_session_and_apply_model(
         channel.id,
         channel.channel_type,
         ctx.session_title.as_deref(),
+        channel.job_evaluation,
     );
 
     let resp = agent
@@ -1276,8 +1282,20 @@ fn mcp_servers_with_git_origin(
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
     agent_name: Option<&str>,
+    job_evaluation: bool,
 ) -> Vec<McpServer> {
     let mut servers = servers.to_vec();
+    if job_evaluation {
+        // Unknown MCP servers may expose mutations and cannot be trusted to
+        // honor Buzz's evaluation-only environment. Keep only the bundled
+        // server whose handlers enforce the restricted tool boundary.
+        servers.retain(|server| {
+            std::path::Path::new(&server.command)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                == Some("buzz-dev-mcp")
+        });
+    }
     let origin = match (channel_id, channel_type) {
         (Some(channel_id), Some("stream")) => Some(EnvVar {
             name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
@@ -1302,13 +1320,19 @@ fn mcp_servers_with_git_origin(
     // turn. If that event is delayed, the turn remains fail-closed instead of
     // continuing as an untracked execution attempt.
     for server in &mut servers {
-        server
-            .env
-            .retain(|entry| entry.name != "BUZZ_ACP_JOB_DECISION_YIELD");
-        server.env.push(EnvVar {
-            name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
-            value: "1".into(),
+        server.env.retain(|entry| {
+            entry.name != "BUZZ_ACP_JOB_DECISION_YIELD" && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
         });
+        if job_evaluation {
+            server.env.push(EnvVar {
+                name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
+                value: "1".into(),
+            });
+            server.env.push(EnvVar {
+                name: "BUZZ_JOB_EVALUATION_ONLY".into(),
+                value: "1".into(),
+            });
+        }
     }
     servers
 }
@@ -1795,6 +1819,12 @@ pub async fn run_prompt_task(
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
 ) {
+    let job_evaluation = batch.as_ref().is_some_and(|batch| {
+        batch.events.iter().all(|event| {
+            event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST
+                && crate::job_execution::from_prompt_tag(&event.prompt_tag).is_none()
+        })
+    });
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.channel_id),
@@ -1804,6 +1834,12 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
+    if job_evaluation {
+        // Evaluation must never inherit an unrestricted MCP session. A fresh
+        // session receives an evaluation-only tool environment; the decision
+        // boundary rotates it away before claimed execution is dispatched.
+        agent.state.invalidate(&source);
+    }
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -2016,6 +2052,7 @@ pub async fn run_prompt_task(
                         name: title_channel.as_deref(),
                         id: Some(*cid),
                         channel_type: origin_channel_type.as_deref(),
+                        job_evaluation,
                     },
                 )
                 .await
@@ -2081,6 +2118,7 @@ pub async fn run_prompt_task(
                         name: None,
                         id: None,
                         channel_type: None,
+                        job_evaluation: false,
                     },
                 )
                 .await
@@ -4771,6 +4809,7 @@ mod tests {
             Some(channel_id),
             Some("stream"),
             None,
+            false,
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
@@ -4779,10 +4818,10 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
-        assert!(servers[0]
+        assert!(!servers[0]
             .env
             .iter()
-            .any(|entry| { entry.name == "BUZZ_ACP_JOB_DECISION_YIELD" && entry.value == "1" }));
+            .any(|entry| entry.name == "BUZZ_ACP_JOB_DECISION_YIELD"));
     }
 
     #[test]
@@ -4792,6 +4831,7 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("dm"),
             Some("Builder"),
+            false,
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
@@ -4800,10 +4840,32 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
-        assert!(servers[0]
+        assert!(!servers[0]
             .env
             .iter()
-            .any(|entry| { entry.name == "BUZZ_ACP_JOB_DECISION_YIELD" && entry.value == "1" }));
+            .any(|entry| entry.name == "BUZZ_ACP_JOB_DECISION_YIELD"));
+    }
+
+    #[test]
+    fn job_evaluation_keeps_only_restricted_bundled_mcp() {
+        let mut unknown = test_mcp_server();
+        unknown.name = "external".into();
+        unknown.command = "external-mcp".into();
+        let servers = mcp_servers_with_git_origin(
+            &[test_mcp_server(), unknown],
+            Some(Uuid::new_v4()),
+            Some("stream"),
+            None,
+            true,
+        );
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].command, "buzz-dev-mcp");
+        for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
+            assert!(servers[0]
+                .env
+                .iter()
+                .any(|entry| entry.name == name && entry.value == "1"));
+        }
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -8615,6 +8677,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -8652,6 +8716,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -8686,6 +8752,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -8719,6 +8787,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -8759,6 +8829,8 @@ exit 0"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -8886,6 +8958,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -8957,6 +9031,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9012,6 +9088,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9054,6 +9132,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9095,6 +9175,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9161,6 +9243,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9198,6 +9282,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9271,6 +9357,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await
@@ -9312,6 +9400,8 @@ done"#
                 name: None,
                 id: None,
                 channel_type: None,
+
+                job_evaluation: false,
             },
         )
         .await

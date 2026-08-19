@@ -3898,7 +3898,8 @@ fn signal_job_evaluation_boundary(
         .find(|meta| meta.job_evaluation.as_ref() == Some(evaluation));
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            let _ = tx.send(ControlSignal::Cancel);
+            meta.job_evaluation_decided = true;
+            let _ = tx.send(ControlSignal::Rotate);
             return true;
         }
     }
@@ -4143,6 +4144,7 @@ fn dispatch_pending(
                 turn_id,
                 job_execution,
                 job_evaluation,
+                job_evaluation_decided: false,
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
@@ -4244,6 +4246,11 @@ fn handle_prompt_result(
         .values()
         .find(|meta| meta.agent_index == agent_index)
         .and_then(|meta| meta.job_evaluation.clone());
+    let job_evaluation_decided = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .is_some_and(|meta| meta.job_evaluation_decided);
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -4282,7 +4289,6 @@ fn handle_prompt_result(
             .events
             .iter()
             .any(|event| job_execution::from_prompt_tag(&event.prompt_tag).is_some());
-        let is_job_evaluation = job_evaluation.is_some();
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if is_job_attempt {
@@ -4290,7 +4296,10 @@ fn handle_prompt_result(
                 channel_id = %batch.channel_id,
                 "job attempt ended; durable reconciliation owns continuation"
             );
-        } else if should_drop_decided_job_evaluation(is_job_evaluation) {
+        } else if should_drop_decided_job_evaluation(
+            job_evaluation.is_some(),
+            job_evaluation_decided,
+        ) {
             tracing::info!(
                 channel_id = %batch.channel_id,
                 "job evaluation ended at its durable decision boundary; dropping proposal batch"
@@ -4650,8 +4659,11 @@ fn handle_prompt_result(
 /// A proposal turn carrying durable evaluation metadata is consumed by its
 /// accept/reject decision. It must never enter ordinary cancel-and-merge
 /// requeue handling.
-fn should_drop_decided_job_evaluation(has_evaluation_context: bool) -> bool {
-    has_evaluation_context
+fn should_drop_decided_job_evaluation(
+    has_evaluation_context: bool,
+    matching_decision_observed: bool,
+) -> bool {
+    has_evaluation_context && matching_decision_observed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4834,6 +4846,8 @@ fn dispatch_heartbeat(
             turn_id,
             job_execution: None,
             job_evaluation: None,
+
+            job_evaluation_decided: false,
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5635,6 +5649,8 @@ mod owner_control_command_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -5679,6 +5695,8 @@ mod owner_control_command_tests {
                 turn_id: "evaluation-turn".into(),
                 job_execution: None,
                 job_evaluation: Some(evaluation.clone()),
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -5690,14 +5708,15 @@ mod owner_control_command_tests {
         wrong.job_id = Uuid::new_v4();
         assert!(!signal_job_evaluation_boundary(&mut pool, &wrong));
         assert!(signal_job_evaluation_boundary(&mut pool, &evaluation));
-        assert_eq!(control_rx.await.unwrap(), ControlSignal::Cancel);
+        assert_eq!(control_rx.await.unwrap(), ControlSignal::Rotate);
         assert!(!signal_job_evaluation_boundary(&mut pool, &evaluation));
     }
 
     #[test]
     fn decided_job_evaluation_is_dropped_instead_of_requeued() {
-        assert!(should_drop_decided_job_evaluation(true));
-        assert!(!should_drop_decided_job_evaluation(false));
+        assert!(should_drop_decided_job_evaluation(true, true));
+        assert!(!should_drop_decided_job_evaluation(true, false));
+        assert!(!should_drop_decided_job_evaluation(false, true));
     }
 
     #[test]
@@ -7803,6 +7822,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7877,6 +7898,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7994,6 +8017,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8061,6 +8086,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8140,6 +8167,8 @@ mod error_outcome_emission_tests {
                 turn_id: "panic-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8235,6 +8264,8 @@ mod error_outcome_emission_tests {
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
                     job_evaluation: None,
+
+                    job_evaluation_decided: false,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8329,6 +8360,8 @@ mod error_outcome_emission_tests {
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
                     job_evaluation: None,
+
+                    job_evaluation_decided: false,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8437,6 +8470,8 @@ mod error_outcome_emission_tests {
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
                     job_evaluation: None,
+
+                    job_evaluation_decided: false,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8516,6 +8551,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8613,6 +8650,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8732,6 +8771,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8874,6 +8915,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9065,6 +9108,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9153,6 +9198,8 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
                 job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
