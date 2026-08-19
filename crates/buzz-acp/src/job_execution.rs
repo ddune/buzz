@@ -34,6 +34,24 @@ pub struct JobExecutionContext {
     pub lease_until: i64,
 }
 
+/// Identity of a proposed delegated job whose accept/reject decision is being
+/// made by an ordinary ACP turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobEvaluationContext {
+    pub job_id: Uuid,
+    pub request_event_id: String,
+    pub channel_id: Uuid,
+}
+
+pub fn evaluation_context(event: &Event) -> Option<JobEvaluationContext> {
+    let request = parse_job_request(event).ok()?;
+    Some(JobEvaluationContext {
+        job_id: request.job_id,
+        request_event_id: request.request_event_id,
+        channel_id: request.channel_id,
+    })
+}
+
 const PROMPT_TAG_PREFIX: &str = "delegated-job-continuation:";
 
 /// Encode attempt metadata into the harness-internal queue tag.
@@ -456,6 +474,32 @@ mod tests {
         ] {
             assert_ne!(state, JobState::Accepted);
         }
+    }
+
+    #[test]
+    fn evaluation_context_is_bound_to_the_immutable_request_coordinates() {
+        let requester = Keys::generate();
+        let target = Keys::generate();
+        let job_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let request = EventBuilder::new(Kind::Custom(KIND_JOB_REQUEST as u16), "assignment")
+            .tags([
+                Tag::parse(["d", &job_id.to_string()]).expect("tag"),
+                Tag::parse(["job-target", &target.public_key().to_hex()]).expect("tag"),
+                Tag::parse(["p", &target.public_key().to_hex()]).expect("tag"),
+                Tag::parse(["h", &channel_id.to_string()]).expect("tag"),
+            ])
+            .sign_with_keys(&requester)
+            .expect("request");
+
+        assert_eq!(
+            evaluation_context(&request),
+            Some(JobEvaluationContext {
+                job_id,
+                request_event_id: request.id.to_hex(),
+                channel_id,
+            })
+        );
     }
 
     #[test]

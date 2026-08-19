@@ -1277,8 +1277,8 @@ pub fn resolve_channel_filters(
     rules: &[SubscriptionRule],
 ) -> HashMap<Uuid, ChannelFilter> {
     use buzz_core::kind::{
-        KIND_JOB_REQUEST, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
-        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_JOB_ACCEPTED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_STREAM_MESSAGE,
+        KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
 
     let target_channels: Vec<Uuid> = if let Some(ref overrides) = config.channels_override {
@@ -1365,7 +1365,8 @@ pub fn resolve_channel_filters(
 
     // Delegated-job ingress is an invariant control-plane subscription, not a
     // conversational rule. Every channel where this agent is a discovered
-    // member must admit targeted 43001 events even when kind overrides or
+    // member must admit targeted requests plus the target-authored decision
+    // events that close evaluation turns, even when kind overrides or
     // config-mode rules omit ordinary conversational traffic.
     for channel_id in discovered_channels {
         let filter = result.entry(*channel_id).or_insert_with(|| ChannelFilter {
@@ -1373,8 +1374,10 @@ pub fn resolve_channel_filters(
             require_mention: true,
         });
         if let Some(kinds) = &mut filter.kinds {
-            if !kinds.contains(&KIND_JOB_REQUEST) {
-                kinds.push(KIND_JOB_REQUEST);
+            for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
             }
         }
     }
@@ -1392,8 +1395,8 @@ pub fn resolve_dynamic_channel_filter(
     rules: &[crate::filter::SubscriptionRule],
 ) -> Option<ChannelFilter> {
     use buzz_core::kind::{
-        KIND_JOB_REQUEST, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
-        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_JOB_ACCEPTED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_STREAM_MESSAGE,
+        KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
 
     // In Mentions/All mode, if the operator explicitly constrained channels
@@ -1407,7 +1410,7 @@ pub fn resolve_dynamic_channel_filter(
                 .any(|s| s.parse::<Uuid>().ok() == Some(channel_id));
             if !allowed {
                 return Some(ChannelFilter {
-                    kinds: Some(vec![KIND_JOB_REQUEST]),
+                    kinds: Some(vec![KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED]),
                     require_mention: true,
                 });
             }
@@ -1415,21 +1418,39 @@ pub fn resolve_dynamic_channel_filter(
     }
 
     match config.subscribe_mode {
-        SubscribeMode::Mentions => Some(ChannelFilter {
-            kinds: Some(config.kinds_override.clone().unwrap_or_else(|| {
+        SubscribeMode::Mentions => {
+            let mut kinds = config.kinds_override.clone().unwrap_or_else(|| {
                 vec![
                     KIND_STREAM_MESSAGE,
                     KIND_JOB_REQUEST,
                     KIND_WORKFLOW_APPROVAL_REQUESTED,
                     KIND_STREAM_REMINDER,
                 ]
-            })),
-            require_mention: !config.no_mention_filter,
-        }),
-        SubscribeMode::All => Some(ChannelFilter {
-            kinds: config.kinds_override.clone(),
-            require_mention: false,
-        }),
+            });
+            for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            Some(ChannelFilter {
+                kinds: Some(kinds),
+                require_mention: !config.no_mention_filter,
+            })
+        }
+        SubscribeMode::All => {
+            let mut kinds = config.kinds_override.clone();
+            if let Some(kinds) = &mut kinds {
+                for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+            }
+            Some(ChannelFilter {
+                kinds,
+                require_mention: false,
+            })
+        }
         SubscribeMode::Config => {
             // Same merge logic as resolve_channel_filters() Config branch:
             // evaluate ALL rules against this specific channel (including
@@ -1459,14 +1480,16 @@ pub fn resolve_dynamic_channel_filter(
 
             if !has_rule {
                 return Some(ChannelFilter {
-                    kinds: Some(vec![KIND_JOB_REQUEST]),
+                    kinds: Some(vec![KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED]),
                     require_mention: true,
                 });
             }
 
             if let Some(kinds) = &mut merged_kinds {
-                if !kinds.contains(&KIND_JOB_REQUEST) {
-                    kinds.push(KIND_JOB_REQUEST);
+                for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
                 }
             }
             Some(ChannelFilter {
@@ -1591,7 +1614,13 @@ mod tests {
         let f = result.get(&channels[0]).unwrap();
         assert_eq!(
             f.kinds.as_ref().unwrap(),
-            &[1, 7, buzz_core::kind::KIND_JOB_REQUEST]
+            &[
+                1,
+                7,
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_ACCEPTED,
+                buzz_core::kind::KIND_JOB_REJECTED,
+            ]
         );
     }
 
@@ -1858,7 +1887,13 @@ mod tests {
         let f = result.get(&channels[0]).unwrap();
         assert_eq!(
             f.kinds.as_ref().unwrap(),
-            &[9, 7, buzz_core::kind::KIND_JOB_REQUEST]
+            &[
+                9,
+                7,
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_ACCEPTED,
+                buzz_core::kind::KIND_JOB_REJECTED,
+            ]
         );
     }
 
@@ -1879,7 +1914,13 @@ mod tests {
         assert!(result.contains_key(&ch_a));
         assert_eq!(
             result.get(&ch_b).and_then(|filter| filter.kinds.as_deref()),
-            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+            Some(
+                &[
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    buzz_core::kind::KIND_JOB_ACCEPTED,
+                    buzz_core::kind::KIND_JOB_REJECTED,
+                ][..]
+            )
         );
         assert!(!result.contains_key(&ch_unknown));
     }
@@ -1900,7 +1941,12 @@ mod tests {
         let f = result.get(&ch).unwrap();
         assert_eq!(
             f.kinds.as_ref().unwrap(),
-            &[9, buzz_core::kind::KIND_JOB_REQUEST]
+            &[
+                9,
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_ACCEPTED,
+                buzz_core::kind::KIND_JOB_REJECTED,
+            ]
         );
         assert!(!f.require_mention);
     }
@@ -1922,7 +1968,13 @@ mod tests {
         assert!(result.contains_key(&ch_a));
         assert_eq!(
             result.get(&ch_b).and_then(|filter| filter.kinds.as_deref()),
-            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+            Some(
+                &[
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    buzz_core::kind::KIND_JOB_ACCEPTED,
+                    buzz_core::kind::KIND_JOB_REJECTED,
+                ][..]
+            )
         );
     }
 
@@ -1979,7 +2031,13 @@ mod tests {
         let filter = result.get(&ch).expect("job-only filter");
         assert_eq!(
             filter.kinds.as_deref(),
-            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+            Some(
+                &[
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    buzz_core::kind::KIND_JOB_ACCEPTED,
+                    buzz_core::kind::KIND_JOB_REJECTED,
+                ][..]
+            )
         );
         assert!(filter.require_mention);
     }

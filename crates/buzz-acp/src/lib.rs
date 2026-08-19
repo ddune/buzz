@@ -2786,6 +2786,59 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            // Accept/reject is a structural boundary for a
+                            // delegated-job evaluation turn. Observe our own
+                            // lifecycle events before the generic ignore-self
+                            // gate: the target agent authors these events. On
+                            // acceptance, stop the proposal turn and establish
+                            // runnable generation 1 + its claim before any
+                            // repository execution is dispatched.
+                            if matches!(kind_u32, KIND_JOB_ACCEPTED | KIND_JOB_REJECTED) {
+                                let lifecycle = buzz_core::delegated_job::parse_job_lifecycle(
+                                    &buzz_event.event,
+                                );
+                                if let Ok(lifecycle) = lifecycle {
+                                    let evaluation = job_execution::JobEvaluationContext {
+                                        job_id: lifecycle.job_id,
+                                        request_event_id: lifecycle.request_event_id,
+                                        channel_id: lifecycle.channel_id,
+                                    };
+                                    if lifecycle.author == pubkey_hex
+                                        && lifecycle.channel_id == buzz_event.channel_id
+                                    {
+                                        let stopped = signal_job_evaluation_boundary(
+                                            &mut pool,
+                                            &evaluation,
+                                        );
+                                        tracing::info!(
+                                            job_id = %evaluation.job_id,
+                                            request_event_id = %evaluation.request_event_id,
+                                            stopped,
+                                            kind = kind_u32,
+                                            "delegated-job decision closed its evaluation turn"
+                                        );
+                                        if kind_u32 == KIND_JOB_ACCEPTED {
+                                            match job_execution::reconcile(
+                                                &ctx.rest_client,
+                                                &queued_job_attempts,
+                                                config.max_turn_duration_secs
+                                                    + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                                            ).await {
+                                                Ok(work) => enqueue_job_continuations(
+                                                    &mut queue,
+                                                    &mut queued_job_attempts,
+                                                    work,
+                                                ),
+                                                Err(error) => tracing::warn!(
+                                                    "post-accept delegated-job reconciliation failed: {error}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
@@ -3833,6 +3886,25 @@ fn signal_in_flight_task(
     false
 }
 
+/// Stop exactly the proposal turn that produced a durable accept/reject event.
+/// Ordinary work in the same channel is deliberately unaffected.
+fn signal_job_evaluation_boundary(
+    pool: &mut AgentPool,
+    evaluation: &job_execution::JobEvaluationContext,
+) -> bool {
+    let entry = pool
+        .task_map_mut()
+        .values_mut()
+        .find(|meta| meta.job_evaluation.as_ref() == Some(evaluation));
+    if let Some(meta) = entry {
+        if let Some(tx) = meta.control_tx.take() {
+            let _ = tx.send(ControlSignal::Cancel);
+            return true;
+        }
+    }
+    false
+}
+
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
 ///
 /// Caller invariants:
@@ -4040,6 +4112,10 @@ fn dispatch_pending(
             .events
             .iter()
             .find_map(|event| job_execution::from_prompt_tag(&event.prompt_tag));
+        let job_evaluation = batch
+            .events
+            .iter()
+            .find_map(|event| job_execution::evaluation_context(&event.event));
         let turn_id = job_execution
             .as_ref()
             .map(|execution| execution.turn_id.clone())
@@ -4066,6 +4142,7 @@ fn dispatch_pending(
                 channel_id: Some(channel_id),
                 turn_id,
                 job_execution,
+                job_evaluation,
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
@@ -4738,6 +4815,7 @@ fn dispatch_heartbeat(
             channel_id: None,
             turn_id,
             job_execution: None,
+            job_evaluation: None,
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5538,6 +5616,7 @@ mod owner_control_command_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -5561,6 +5640,40 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+
+    #[tokio::test]
+    async fn job_decision_cancels_only_the_matching_evaluation_turn() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let evaluation = job_execution::JobEvaluationContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "ab".repeat(32),
+            channel_id,
+        };
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "evaluation-turn".into(),
+                job_execution: None,
+                job_evaluation: Some(evaluation.clone()),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let mut wrong = evaluation.clone();
+        wrong.job_id = Uuid::new_v4();
+        assert!(!signal_job_evaluation_boundary(&mut pool, &wrong));
+        assert!(signal_job_evaluation_boundary(&mut pool, &evaluation));
+        assert_eq!(control_rx.await.unwrap(), ControlSignal::Cancel);
+        assert!(!signal_job_evaluation_boundary(&mut pool, &evaluation));
     }
 
     #[test]
@@ -7665,6 +7778,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7738,6 +7852,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7854,6 +7969,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7920,6 +8036,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7998,6 +8115,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "panic-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8092,6 +8210,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
+                    job_evaluation: None,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8185,6 +8304,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
+                    job_evaluation: None,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8292,6 +8412,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
+                    job_evaluation: None,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8370,6 +8491,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8466,6 +8588,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8584,6 +8707,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8725,6 +8849,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8915,6 +9040,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9002,6 +9128,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,

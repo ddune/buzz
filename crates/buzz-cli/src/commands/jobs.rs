@@ -2,6 +2,7 @@
 
 use nostr::{EventBuilder, Kind, Tag};
 use std::collections::HashMap;
+use std::io::Write;
 use uuid::Uuid;
 
 use crate::client::{normalize_write_response, BuzzClient};
@@ -96,8 +97,28 @@ async fn lifecycle(
     let event = client
         .sign_event(EventBuilder::new(Kind::Custom(kind as u16), &args.content).tags(tags))?;
     let response = client.submit_event(event).await?;
-    println!("{}", normalize_write_response(&response));
+    let normalized = normalize_write_response(&response);
+    println!("{normalized}");
+    if should_yield_after_decision(
+        kind,
+        &normalized,
+        std::env::var_os("BUZZ_ACP_JOB_DECISION_YIELD").is_some(),
+    ) {
+        // Ensure the tool result is observable for diagnostics before this
+        // process is terminated by the ACP evaluation-turn cancellation.
+        let _ = std::io::stdout().flush();
+        std::future::pending::<()>().await;
+    }
     Ok(())
+}
+
+fn should_yield_after_decision(kind: u32, response: &str, acp_gate: bool) -> bool {
+    acp_gate
+        && matches!(kind, KIND_JOB_ACCEPTED | KIND_JOB_REJECTED)
+        && serde_json::from_str::<serde_json::Value>(response)
+            .ok()
+            .and_then(|value| value.get("accepted").and_then(serde_json::Value::as_bool))
+            == Some(true)
 }
 
 async fn get(client: &BuzzClient, job: &str) -> Result<(), CliError> {
@@ -240,5 +261,36 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn acp_job_decision_yields_only_after_successful_accept_or_reject() {
+        let accepted = r#"{"accepted":true}"#;
+        let rejected = r#"{"accepted":false}"#;
+        assert!(should_yield_after_decision(
+            KIND_JOB_ACCEPTED,
+            accepted,
+            true
+        ));
+        assert!(should_yield_after_decision(
+            KIND_JOB_REJECTED,
+            accepted,
+            true
+        ));
+        assert!(!should_yield_after_decision(
+            KIND_JOB_COMPLETED,
+            accepted,
+            true
+        ));
+        assert!(!should_yield_after_decision(
+            KIND_JOB_ACCEPTED,
+            rejected,
+            true
+        ));
+        assert!(!should_yield_after_decision(
+            KIND_JOB_ACCEPTED,
+            accepted,
+            false
+        ));
     }
 }

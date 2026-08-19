@@ -63,6 +63,10 @@ pub struct TaskMeta {
     pub turn_id: String,
     /// Accepted-job attempt bound to this runtime turn, when job-class work.
     pub job_execution: Option<crate::job_execution::JobExecutionContext>,
+    /// Proposed delegated job being evaluated by this turn. A matching
+    /// acceptance or rejection is a hard turn boundary: accepted work must
+    /// resume only through a durably claimed execution continuation.
+    pub job_evaluation: Option<crate::job_execution::JobEvaluationContext>,
     /// Clone of batch for Queue mode panic recovery.
     pub recoverable_batch: Option<FlushBatch>,
     /// Control signal for the in-flight prompt task.
@@ -1291,6 +1295,20 @@ fn mcp_servers_with_git_origin(
         for server in &mut servers {
             server.env.push(origin.clone());
         }
+    }
+    // A successful accept/reject issued through an ACP tool must not return
+    // control to the model. The CLI waits after persisting the decision; the
+    // matching relay lifecycle event makes the harness cancel this evaluation
+    // turn. If that event is delayed, the turn remains fail-closed instead of
+    // continuing as an untracked execution attempt.
+    for server in &mut servers {
+        server
+            .env
+            .retain(|entry| entry.name != "BUZZ_ACP_JOB_DECISION_YIELD");
+        server.env.push(EnvVar {
+            name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
+            value: "1".into(),
+        });
     }
     servers
 }
@@ -4761,6 +4779,10 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
+        assert!(servers[0]
+            .env
+            .iter()
+            .any(|entry| { entry.name == "BUZZ_ACP_JOB_DECISION_YIELD" && entry.value == "1" }));
     }
 
     #[test]
@@ -4778,6 +4800,10 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+        assert!(servers[0]
+            .env
+            .iter()
+            .any(|entry| { entry.name == "BUZZ_ACP_JOB_DECISION_YIELD" && entry.value == "1" }));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):

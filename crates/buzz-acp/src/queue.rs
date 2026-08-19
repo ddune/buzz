@@ -1652,7 +1652,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         .all(|event| event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST)
     {
         let mut orientation = String::from(
-            "[Delegated job request]\nThis is a proposed delegation, not accepted work. Inspect the assignment and structurally accept or reject it; conversational prose is not authoritative.",
+            "[Delegated job request]\nThis is a proposed delegation, not accepted work. Inspect the assignment and structurally accept or reject it; conversational prose is not authoritative. Acceptance or rejection ends this evaluation turn immediately. Do not begin implementation in this turn: accepted work resumes in a separate continuation only after Buzz has durably created and claimed its first execution generation.",
         );
         for event in &batch.events {
             if let Ok(job) = buzz_core::delegated_job::parse_job_request(&event.event) {
