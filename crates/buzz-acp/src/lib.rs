@@ -3398,6 +3398,13 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if drain_action == LoopAction::Exit {
+                    tracing::warn!(
+                        pending_promotions = panicked_evaluations.len(),
+                        "no runtime remains after evaluation panic; leaving accepted jobs open for restart recovery"
+                    );
+                    break;
+                }
                 for evaluation in panicked_evaluations {
                     if let Some(evaluation) =
                         take_pending_job_promotion(&mut pending_job_promotions, Some(evaluation))
@@ -3417,9 +3424,6 @@ async fn tokio_main() -> Result<()> {
                         )
                         .await;
                     }
-                }
-                if drain_action == LoopAction::Exit {
-                    break;
                 }
                 for (channel_id, thread_tags) in
                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
@@ -3466,6 +3470,13 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
+                    tracing::warn!(
+                        has_pending_promotion = panicked_evaluation.is_some(),
+                        "no runtime remains after evaluation panic; exiting before claim so restart recovery can proceed"
+                    );
+                    break;
+                }
                 if let Some(evaluation) =
                     take_pending_job_promotion(&mut pending_job_promotions, panicked_evaluation)
                 {
@@ -3483,10 +3494,6 @@ async fn tokio_main() -> Result<()> {
                         config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
                     )
                     .await;
-                }
-                if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
-                    tracing::error!("all agents dead — exiting");
-                    break;
                 }
                 for (channel_id, thread_tags) in
                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
@@ -4871,10 +4878,20 @@ fn recover_panicked_agent(
     };
     let i = meta.agent_index;
     let job_evaluation = meta.job_evaluation.clone();
+    let decided_job_evaluation = should_drop_decided_job_evaluation(
+        meta.job_evaluation.is_some(),
+        meta.job_evaluation_decided,
+    );
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
-        if let Some(ch) = meta.channel_id {
+        if decided_job_evaluation {
+            tracing::info!(
+                agent = i,
+                job_id = ?job_evaluation.as_ref().map(|evaluation| evaluation.job_id),
+                "consuming decided delegated-job evaluation after panic"
+            );
+        } else if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
@@ -8420,6 +8437,19 @@ mod error_outcome_emission_tests {
             request_event_id: "request-event-id".to_string(),
             channel_id,
         };
+        let request = EventBuilder::new(Kind::Custom(43001), "proposal")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event: request,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "job-evaluation".to_string(),
+        }));
+        let evaluation_batch = queue.flush_next().expect("evaluation dispatches");
+        assert!(queue.is_channel_in_flight(channel_id));
+
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let abort_handle = pool.join_set.spawn(async move {
             let _ = started_tx.send(());
@@ -8435,7 +8465,7 @@ mod error_outcome_emission_tests {
                 job_execution: None,
                 job_evaluation: Some(evaluation.clone()),
                 job_evaluation_decided: true,
-                recoverable_batch: None,
+                recoverable_batch: Some(evaluation_batch),
                 control_tx: None,
                 steer_tx: None,
                 successful_steer_deliveries: HashSet::new(),
@@ -8444,19 +8474,6 @@ mod error_outcome_emission_tests {
         started_rx.await.unwrap();
         abort_handle.abort();
         let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
-
-        let request = EventBuilder::new(Kind::Custom(43001), "proposal")
-            .sign_with_keys(&Keys::generate())
-            .unwrap();
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        assert!(queue.push(QueuedEvent {
-            channel_id,
-            event: request,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "job-evaluation".to_string(),
-        }));
-        assert!(queue.flush_next().is_some());
-        assert!(queue.is_channel_in_flight(channel_id));
 
         let mut pending = HashMap::from([(evaluation.job_id, evaluation.clone())]);
         let config = test_config();
@@ -8486,6 +8503,10 @@ mod error_outcome_emission_tests {
         );
 
         assert!(!queue.is_channel_in_flight(channel_id));
+        assert!(
+            queue.flush_next().is_none(),
+            "a decided evaluation proposal must not be requeued after panic"
+        );
         assert_eq!(
             take_pending_job_promotion(&mut pending, recovered_evaluation),
             Some(evaluation)
