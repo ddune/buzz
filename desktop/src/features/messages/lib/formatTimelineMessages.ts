@@ -21,11 +21,11 @@ import {
 import { getMentionTagPubkey } from "@/shared/lib/resolveMentionNames";
 import {
   KIND_JOB_ACCEPTED,
-  KIND_JOB_CANCEL,
-  KIND_JOB_ERROR,
-  KIND_JOB_PROGRESS,
+  KIND_JOB_BLOCKED,
+  KIND_JOB_DELEGATED,
+  KIND_JOB_REJECTED,
   KIND_JOB_REQUEST,
-  KIND_JOB_RESULT,
+  KIND_JOB_COMPLETED,
   KIND_HUDDLE_STARTED,
   KIND_DELETION,
   KIND_NIP29_DELETE_EVENT,
@@ -54,10 +54,10 @@ export function isTimelineContentEvent(event: RelayEvent) {
     event.kind === KIND_SYSTEM_MESSAGE ||
     event.kind === KIND_JOB_REQUEST ||
     event.kind === KIND_JOB_ACCEPTED ||
-    event.kind === KIND_JOB_PROGRESS ||
-    event.kind === KIND_JOB_RESULT ||
-    event.kind === KIND_JOB_CANCEL ||
-    event.kind === KIND_JOB_ERROR ||
+    event.kind === KIND_JOB_REJECTED ||
+    event.kind === KIND_JOB_COMPLETED ||
+    event.kind === KIND_JOB_BLOCKED ||
+    event.kind === KIND_JOB_DELEGATED ||
     event.kind === KIND_HUDDLE_STARTED
   );
 }

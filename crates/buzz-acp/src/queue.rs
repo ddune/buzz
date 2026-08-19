@@ -334,7 +334,20 @@ impl EventQueue {
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
         let queue = self.queues.entry(channel_id).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        // Delegated-job requests never share a runtime batch with ordinary
+        // conversational events. This keeps job acceptance decisions out of
+        // generic message dispatch while preserving the existing queue.
+        let head_is_job = queue.front().is_some_and(|event| {
+            event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST
+        });
+        let same_class = queue
+            .iter()
+            .take_while(|event| {
+                (event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST)
+                    == head_is_job
+            })
+            .count();
+        let drain_count = MAX_BATCH_EVENTS.min(same_class);
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -1585,6 +1598,31 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
 
     let mut sections: Vec<String> = Vec::with_capacity(7);
 
+    if batch
+        .events
+        .iter()
+        .all(|event| event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST)
+    {
+        let mut orientation = String::from(
+            "[Delegated job request]\nThis is a proposed delegation, not accepted work. Inspect the assignment and structurally accept or reject it; conversational prose is not authoritative.",
+        );
+        for event in &batch.events {
+            if let Ok(job) = buzz_core::delegated_job::parse_job_request(&event.event) {
+                orientation.push_str(&format!(
+                    "\n\nJob {}:\n- accept: `buzz jobs accept --job {} --request {} --channel {}`\n- reject: `buzz jobs reject --job {} --request {} --channel {} --content <reason>`",
+                    job.job_id,
+                    job.job_id,
+                    job.request_event_id,
+                    job.channel_id,
+                    job.job_id,
+                    job.request_event_id,
+                    job.channel_id,
+                ));
+            }
+        }
+        sections.push(orientation);
+    }
+
     // Standing context — base prompt, persona, team instructions, core memory
     // and canvas. Modern agents received all of it via the system role in
     // session/new. Legacy agents get it here, in the session's first message
@@ -1798,6 +1836,28 @@ mod tests {
         }
     }
 
+    fn make_job_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
+        let keys = Keys::generate();
+        let target = Keys::generate().public_key().to_hex();
+        QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_JOB_REQUEST as u16),
+                content,
+            )
+            .tags([
+                nostr::Tag::parse(["d", &Uuid::new_v4().to_string()]).unwrap(),
+                nostr::Tag::parse(["job-target", &target]).unwrap(),
+                nostr::Tag::parse(["p", &target]).unwrap(),
+                nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap(),
+            received_at: Instant::now(),
+            prompt_tag: "delegated-job-request".into(),
+        }
+    }
+
     /// Build a QueuedEvent with a specific `received_at` offset from now.
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
@@ -1834,6 +1894,46 @@ mod tests {
 
     fn any_in_flight(q: &EventQueue) -> bool {
         !q.in_flight_channels.is_empty()
+    }
+
+    #[test]
+    fn delegated_job_and_conversation_never_share_a_runtime_batch() {
+        let channel = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(make_queued(channel, "ordinary mention")));
+        assert!(queue.push(make_job_queued(channel, "bounded assignment")));
+
+        let first = queue.flush_next().expect("conversation batch");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].event.kind, Kind::Custom(9));
+        queue.mark_complete(channel);
+
+        let second = queue.flush_next().expect("job batch");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(
+            second.events[0].event.kind,
+            Kind::Custom(buzz_core::kind::KIND_JOB_REQUEST as u16)
+        );
+    }
+
+    #[test]
+    fn delegated_job_prompt_requires_structural_accept_or_reject() {
+        let channel = Uuid::new_v4();
+        let event = make_job_queued(channel, "bounded assignment");
+        let batch = FlushBatch {
+            channel_id: channel,
+            events: vec![BatchEvent {
+                event: event.event,
+                prompt_tag: event.prompt_tag,
+                received_at: event.received_at,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        assert!(prompt.contains("proposed delegation, not accepted work"));
+        assert!(prompt.contains("buzz jobs accept"));
+        assert!(prompt.contains("buzz jobs reject"));
     }
 
     #[test]

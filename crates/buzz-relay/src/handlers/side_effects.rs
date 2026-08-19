@@ -9,9 +9,10 @@ use uuid::Uuid;
 use buzz_core::kind::{
     event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED, KIND_JOB_DELEGATED, KIND_JOB_REJECTED,
+    KIND_JOB_REQUEST, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -34,6 +35,18 @@ pub fn is_admin_kind(kind: u32) -> bool {
 /// duplicates without storing the event at all.
 pub fn is_side_effect_kind(kind: u32) -> bool {
     matches!(kind, 0 | 5 | 9000..=9022 | KIND_GIT_REPO_ANNOUNCEMENT | KIND_AGENT_PROFILE | 41001..=41003 | 40099)
+}
+
+fn is_delegated_job_event(event: &Event) -> bool {
+    matches!(
+        event_kind_u32(event),
+        KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_REJECTED
+            | KIND_JOB_COMPLETED
+            | KIND_JOB_BLOCKED
+            | KIND_JOB_DELEGATED
+    )
 }
 
 async fn evict_live_channel_subscriptions(
@@ -265,6 +278,12 @@ pub async fn validate_standard_deletion_event(
             .get_event_by_id_including_deleted(tenant.community(), &target_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+
+        if is_delegated_job_event(&target_event.event) {
+            return Err(anyhow::anyhow!(
+                "delegated job history is append-only and cannot be deleted"
+            ));
+        }
 
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
@@ -659,6 +678,12 @@ pub async fn validate_admin_event(
                 .await
                 .map_err(|e| anyhow::anyhow!("db error looking up target: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+
+            if is_delegated_job_event(&target_event.event) {
+                return Err(anyhow::anyhow!(
+                    "delegated job history is append-only and cannot be deleted"
+                ));
+            }
 
             match target_event.channel_id {
                 Some(target_ch) if target_ch != channel_id => {

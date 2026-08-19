@@ -29,6 +29,8 @@ pub mod event;
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
 pub mod git_repo;
+/// Durable materialized state for append-only delegated-job events.
+pub mod job;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.
@@ -2779,6 +2781,51 @@ impl Db {
         actor_pubkey: &[u8],
     ) -> Result<bool> {
         user::is_agent_owner(&self.pool, community_id, target_pubkey, actor_pubkey).await
+    }
+
+    /// Atomically store a validated delegated-job request and materialize its state.
+    pub async fn accept_job_request(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        request: &buzz_core::delegated_job::JobRequest,
+    ) -> std::result::Result<job::JobWriteOutcome, job::JobWriteError> {
+        job::accept_request(&self.pool, community_id, event, request).await
+    }
+
+    /// Atomically store a validated delegated-job lifecycle event.
+    pub async fn accept_job_lifecycle(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        lifecycle: &buzz_core::delegated_job::JobLifecycleEvent,
+    ) -> std::result::Result<job::JobWriteOutcome, job::JobWriteError> {
+        job::accept_lifecycle(&self.pool, community_id, event, lifecycle).await
+    }
+
+    /// Fetch the current durable state of one delegated job.
+    pub async fn get_job(
+        &self,
+        community_id: CommunityId,
+        job_id: Uuid,
+    ) -> Result<Option<job::JobRecord>> {
+        job::get_job(&self.pool, community_id, job_id).await
+    }
+
+    /// List jobs targeting an agent, optionally only accepted non-terminal jobs.
+    pub async fn list_jobs_for_agent(
+        &self,
+        community_id: CommunityId,
+        target_pubkey: &[u8],
+        accepted_non_terminal_only: bool,
+    ) -> Result<Vec<job::JobRecord>> {
+        job::list_jobs_for_agent(
+            &self.pool,
+            community_id,
+            target_pubkey,
+            accepted_non_terminal_only,
+        )
+        .await
     }
 
     /// Set the channel_add_policy for a user.

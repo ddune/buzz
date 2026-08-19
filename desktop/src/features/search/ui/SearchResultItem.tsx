@@ -166,9 +166,17 @@ function describeSearchHit(hit: SearchHit) {
     case 45003:
       return "Forum reply";
     case 43001:
-      return "Agent job";
+      return "Job request";
+    case 43002:
+      return "Job accepted";
     case 43003:
-      return "Agent update";
+      return "Job rejected";
+    case 43004:
+      return "Job completed";
+    case 43005:
+      return "Job blocked";
+    case 43006:
+      return "Job delegated";
     case 46010:
       return "Approval request";
     default:

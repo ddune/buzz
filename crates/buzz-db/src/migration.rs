@@ -625,7 +625,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -645,6 +645,11 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE _operator_global_tables"));
+        assert_eq!(migrations[31].version, 32);
+        assert!(migrations[31]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE delegated_jobs"));
         assert!(migrations[0]
             .sql
             .as_str()
@@ -1485,6 +1490,9 @@ mod tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
+        // Added after the 0029 deletion foundation; migration 0032 attaches
+        // the same mandatory fence when delegated_jobs is introduced.
+        expected_fences.insert("delegated_jobs".to_string());
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

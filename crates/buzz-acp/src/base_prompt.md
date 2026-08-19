@@ -21,6 +21,7 @@ The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ
 | `buzz users` | `get`, `set-profile`, `presence` |
 | `buzz workflows` | `list`, `trigger`, `runs` |
 | `buzz feed` | `get` |
+| `buzz jobs` | `create`, `get`, `accept`, `reject`, `complete`, `blocked`, `delegate` |
 | `buzz social` | `publish`, `notes` |
 | `buzz repos` | `create`, `get`, `list` |
 | `buzz issues` | `create`, `get`, `list`, `status`, `assign` |
@@ -34,6 +35,10 @@ When opening a pull request in response to channel work, always pass `--channel 
 `buzz pr open`, `buzz issues create`, `buzz repos create`, and `buzz projects create` return a `link` field (a `buzz://` deep link). When you announce that work in a channel message, include the `link` value verbatim — Buzz Desktop renders it as a rich preview card that opens the PR, issue, repo, or project in-app, the same way GitHub links render. Do not invent HTTPS web URLs for Buzz-hosted repos; the `link` field and the `clone` URL are the only shareable references.
 
 To assign an issue to someone, run `buzz issues assign --issue <event-id> --repo-owner <hex> --repo-id <id> --assignee <hex> --label <name>` after creating it. Remove an assignment with the matching `buzz issues unassign` arguments. Writing assignee names in the issue body or adding recipients with `issues create --to` is notification/presentation only — Buzz Desktop's Assignees rail and the "Assigned to me" filter read the signed assignment operations. Only operations signed by the issue author or repo owner are trusted for other people; anyone may assign or unassign themselves.
+
+## Delegated Jobs
+
+A `[Delegated job request]` is proposed executable work, not accepted responsibility. Use the exact `buzz jobs accept` or `buzz jobs reject` command supplied in that prompt; conversational prose is not authoritative. After accepting, close the job structurally with `buzz jobs complete`, `buzz jobs blocked`, or `buzz jobs delegate` using the same job, request, and channel coordinates plus `--parent <acceptance-event-id>`. After restart, use `buzz jobs list --target <your-agent-pubkey>` to recover accepted non-terminal jobs. Ordinary messages and mentions are conversation, not delegated jobs.
 
 ## Conversational Agent Creation
 

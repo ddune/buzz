@@ -36,7 +36,7 @@ use uuid::Uuid;
 use buzz_core::kind::{
     KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_GIT_ISSUE, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
     KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
-    KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_JOB_RESULT, KIND_STREAM_MESSAGE,
+    KIND_JOB_COMPLETED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_STREAM_MESSAGE,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEXT_NOTE, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::{CommunityId, StoredEvent};
@@ -263,7 +263,7 @@ fn build_activity_query(
     qb.push(" AND deleted_at IS NULL");
     qb.push(format!(
         " AND kind IN ({KIND_STREAM_MESSAGE}, {KIND_STREAM_MESSAGE_V2}, {KIND_FORUM_POST}, \
-         {KIND_JOB_REQUEST}, {KIND_JOB_PROGRESS}, {KIND_JOB_RESULT})"
+         {KIND_JOB_REQUEST}, {KIND_JOB_REJECTED}, {KIND_JOB_COMPLETED})"
     ));
     push_visible_channel_filter(&mut qb, "channel_id", accessible_channel_ids);
     if let Some(s) = since {
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn activity_query_includes_agent_job_kinds() {
         use buzz_core::kind::{
-            KIND_FORUM_POST, KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_JOB_RESULT,
+            KIND_FORUM_POST, KIND_JOB_COMPLETED, KIND_JOB_REJECTED, KIND_JOB_REQUEST,
             KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
         };
         let activity_kinds: &[u32] = &[
@@ -672,8 +672,8 @@ mod tests {
             KIND_STREAM_MESSAGE_V2,
             KIND_FORUM_POST,
             KIND_JOB_REQUEST,
-            KIND_JOB_PROGRESS,
-            KIND_JOB_RESULT,
+            KIND_JOB_REJECTED,
+            KIND_JOB_COMPLETED,
         ];
 
         assert!(
@@ -681,12 +681,12 @@ mod tests {
             "job request kind must be in activity"
         );
         assert!(
-            activity_kinds.contains(&KIND_JOB_PROGRESS),
-            "job progress kind must be in activity"
+            activity_kinds.contains(&KIND_JOB_REJECTED),
+            "job rejected kind must be in activity"
         );
         assert!(
-            activity_kinds.contains(&KIND_JOB_RESULT),
-            "job result kind must be in activity"
+            activity_kinds.contains(&KIND_JOB_COMPLETED),
+            "job completed kind must be in activity"
         );
         assert!(
             activity_kinds.contains(&KIND_STREAM_MESSAGE),
@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn activity_query_excludes_workflow_execution_kinds() {
         use buzz_core::kind::{
-            KIND_FORUM_POST, KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_JOB_RESULT,
+            KIND_FORUM_POST, KIND_JOB_COMPLETED, KIND_JOB_REJECTED, KIND_JOB_REQUEST,
             KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
         };
         let activity_kinds: &[u32] = &[
@@ -709,8 +709,8 @@ mod tests {
             KIND_STREAM_MESSAGE_V2,
             KIND_FORUM_POST,
             KIND_JOB_REQUEST,
-            KIND_JOB_PROGRESS,
-            KIND_JOB_RESULT,
+            KIND_JOB_REJECTED,
+            KIND_JOB_COMPLETED,
         ];
 
         use buzz_core::kind::{KIND_WORKFLOW_APPROVAL_DENIED, KIND_WORKFLOW_TRIGGERED};
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn needs_action_kinds_do_not_overlap_with_activity_kinds() {
         use buzz_core::kind::{
-            KIND_FORUM_POST, KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_JOB_RESULT,
+            KIND_FORUM_POST, KIND_JOB_COMPLETED, KIND_JOB_REJECTED, KIND_JOB_REQUEST,
             KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER,
             KIND_WORKFLOW_APPROVAL_REQUESTED,
         };
@@ -735,8 +735,8 @@ mod tests {
             KIND_STREAM_MESSAGE_V2,
             KIND_FORUM_POST,
             KIND_JOB_REQUEST,
-            KIND_JOB_PROGRESS,
-            KIND_JOB_RESULT,
+            KIND_JOB_REJECTED,
+            KIND_JOB_COMPLETED,
         ];
 
         for kind in needs_action_kinds {
