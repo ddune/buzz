@@ -207,7 +207,7 @@ async fn create_test_channel(keys: &Keys) -> String {
     channel_uuid.to_string()
 }
 
-async fn seed_managed_agent_in_channel(owner: &Keys, agent: &Keys, channel_id: &str) {
+async fn seed_managed_agent_owner(owner: &Keys, agent: &Keys) {
     let pool = e2e_db_pool().await;
     let community_id = ensure_test_community(&relay_authority()).await;
     let owner_pubkey = owner.public_key().to_bytes();
@@ -228,18 +228,6 @@ async fn seed_managed_agent_in_channel(owner: &Keys, agent: &Keys, channel_id: &
     .execute(&pool)
     .await
     .expect("seed managed agent");
-    sqlx::query(
-        "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
-         VALUES ($1, $2, $3, 'member', $4) \
-         ON CONFLICT (community_id, channel_id, pubkey) DO UPDATE SET removed_at = NULL",
-    )
-    .bind(community_id)
-    .bind(Uuid::parse_str(channel_id).expect("channel UUID"))
-    .bind(agent_pubkey.as_slice())
-    .bind(owner_pubkey.as_slice())
-    .execute(&pool)
-    .await
-    .expect("seed managed agent membership");
 }
 
 fn delegated_job_lifecycle_event(
@@ -268,7 +256,7 @@ async fn delegated_job_relay_enforces_authority_lifecycle_deletion_and_query() {
     let target = Keys::generate();
     let outsider = Keys::generate();
     let channel_id = create_test_channel(&owner).await;
-    seed_managed_agent_in_channel(&owner, &target, &channel_id).await;
+    seed_managed_agent_owner(&owner, &target).await;
 
     let mut owner_client = BuzzTestClient::connect(&relay_url(), &owner)
         .await
@@ -279,6 +267,26 @@ async fn delegated_job_relay_enforces_authority_lifecycle_deletion_and_query() {
     let mut outsider_client = BuzzTestClient::connect(&relay_url(), &outsider)
         .await
         .expect("connect outsider");
+
+    // Use the relay membership path so its authorization cache and durable
+    // channel state are updated together; direct SQL setup would leave the
+    // already-running relay cache stale.
+    let add_target = EventBuilder::new(Kind::Custom(9000), "")
+        .tags([
+            Tag::parse(["h", &channel_id]).unwrap(),
+            Tag::parse(["p", &target.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let add_result = owner_client
+        .send_event(add_target)
+        .await
+        .expect("add managed target to channel");
+    assert!(
+        add_result.accepted,
+        "target membership: {}",
+        add_result.message
+    );
 
     let job_id = Uuid::new_v4();
     let request_tags = [
@@ -301,12 +309,14 @@ async fn delegated_job_relay_enforces_authority_lifecycle_deletion_and_query() {
         .tags(request_tags)
         .sign_with_keys(&owner)
         .unwrap();
+    let request_result = owner_client
+        .send_event(request.clone())
+        .await
+        .expect("submit request");
     assert!(
-        owner_client
-            .send_event(request.clone())
-            .await
-            .expect("submit request")
-            .accepted
+        request_result.accepted,
+        "job request: {}",
+        request_result.message
     );
 
     let forged_accept =
