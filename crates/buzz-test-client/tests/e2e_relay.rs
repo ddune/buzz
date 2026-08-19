@@ -249,6 +249,52 @@ fn delegated_job_lifecycle_event(
         .expect("sign delegated-job lifecycle event")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn job_attempt_event(
+    target: &Keys,
+    job_id: Uuid,
+    request: &nostr::Event,
+    channel_id: &str,
+    attempt_id: Uuid,
+    generation: i64,
+    action: &str,
+    parent: Option<&nostr::Event>,
+    turn_id: Option<&str>,
+    outcome: Option<&str>,
+) -> nostr::Event {
+    let mut tags = vec![
+        Tag::parse(["d", &job_id.to_string()]).unwrap(),
+        Tag::parse(["job-request", &request.id.to_hex()]).unwrap(),
+        Tag::parse(["attempt", &attempt_id.to_string()]).unwrap(),
+        Tag::parse(["generation", &generation.to_string()]).unwrap(),
+        Tag::parse(["job-target", &target.public_key().to_hex()]).unwrap(),
+        Tag::parse(["h", channel_id]).unwrap(),
+        Tag::parse(["attempt-action", action]).unwrap(),
+    ];
+    if let Some(parent) = parent {
+        tags.push(Tag::parse(["attempt-parent", &parent.id.to_hex()]).unwrap());
+    }
+    if let Some(turn_id) = turn_id {
+        tags.push(Tag::parse(["turn-id", turn_id]).unwrap());
+    }
+    if action == "claim" {
+        tags.push(
+            Tag::parse([
+                "lease-until",
+                &(chrono::Utc::now().timestamp() + 3600).to_string(),
+            ])
+            .unwrap(),
+        );
+    }
+    if let Some(outcome) = outcome {
+        tags.push(Tag::parse(["attempt-outcome", outcome]).unwrap());
+    }
+    EventBuilder::new(Kind::Custom(43007), "")
+        .tags(tags)
+        .sign_with_keys(target)
+        .expect("sign job attempt")
+}
+
 #[tokio::test]
 #[ignore]
 async fn delegated_job_relay_enforces_authority_lifecycle_deletion_and_query() {
@@ -358,6 +404,135 @@ async fn delegated_job_relay_enforces_authority_lifecycle_deletion_and_query() {
             .accepted,
         "identical acceptance replay must be harmless"
     );
+
+    // Synthetic continuation across the real relay/persistence boundary:
+    // generation 1 ends normally without disposing the job; generation 2 is
+    // then the sole runnable entitlement and survives a simulated restart.
+    let attempt_1 = Uuid::new_v4();
+    let runnable_1 = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        attempt_1,
+        1,
+        "runnable",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        target_client
+            .send_event(runnable_1.clone())
+            .await
+            .unwrap()
+            .accepted
+    );
+    let claim_1 = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        attempt_1,
+        1,
+        "claim",
+        Some(&runnable_1),
+        Some("turn-1"),
+        None,
+    );
+    assert!(
+        target_client
+            .send_event(claim_1.clone())
+            .await
+            .unwrap()
+            .accepted
+    );
+    let finish_1 = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        attempt_1,
+        1,
+        "finish",
+        Some(&claim_1),
+        Some("turn-1"),
+        Some("end_turn"),
+    );
+    assert!(target_client.send_event(finish_1).await.unwrap().accepted);
+
+    let attempt_2 = Uuid::new_v4();
+    let runnable_2 = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        attempt_2,
+        2,
+        "runnable",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        target_client
+            .send_event(runnable_2.clone())
+            .await
+            .unwrap()
+            .accepted
+    );
+    let duplicate_after_restart = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        Uuid::new_v4(),
+        2,
+        "runnable",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        !target_client
+            .send_event(duplicate_after_restart)
+            .await
+            .unwrap()
+            .accepted,
+        "restart reconciliation must not duplicate generation 2"
+    );
+    let claim_2 = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        attempt_2,
+        2,
+        "claim",
+        Some(&runnable_2),
+        Some("turn-2"),
+        None,
+    );
+    assert!(
+        target_client
+            .send_event(claim_2.clone())
+            .await
+            .unwrap()
+            .accepted
+    );
+    let finish_2 = job_attempt_event(
+        &target,
+        job_id,
+        &request,
+        &channel_id,
+        attempt_2,
+        2,
+        "finish",
+        Some(&claim_2),
+        Some("turn-2"),
+        Some("end_turn"),
+    );
+    assert!(target_client.send_event(finish_2).await.unwrap().accepted);
 
     for deletion_kind in [5_u16, 9005_u16] {
         let mut tags = vec![Tag::parse(["e", &request.id.to_hex()]).unwrap()];

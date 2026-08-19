@@ -15,7 +15,7 @@ import 'inbox_item.dart';
 /// - mentions of me on user-visible channel kinds (also yields thread
 ///   replies, which the thread filter classifies from NIP-10 tags)
 /// - workflow approvals / needs-action events addressed to me
-/// - agent job lifecycle events addressed to me (kinds 43001-43006)
+/// - agent job lifecycle events addressed to me (kinds 43001-43006; 43007 is runtime control)
 /// - recent DM messages from others (desktop surfaces DMs through p-tags;
 ///   mobile queries DM channels directly so untagged DM sends still appear)
 class ActivityNotifier extends AsyncNotifier<HomeFeedResponse> {

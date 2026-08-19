@@ -25,6 +25,8 @@ pub mod dm;
 pub mod error;
 /// Event storage and retrieval.
 pub mod event;
+/// Durable runtime attempts subordinate to accepted delegated jobs.
+pub mod execution_attempt;
 /// Home feed queries.
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
@@ -2801,6 +2803,16 @@ impl Db {
         lifecycle: &buzz_core::delegated_job::JobLifecycleEvent,
     ) -> std::result::Result<job::JobWriteOutcome, job::JobWriteError> {
         job::accept_lifecycle(&self.pool, community_id, event, lifecycle).await
+    }
+
+    /// Atomically validate and persist one execution-attempt control event.
+    pub async fn accept_job_execution_attempt(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        attempt: &buzz_core::execution_attempt::ExecutionAttemptEvent,
+    ) -> std::result::Result<job::JobWriteOutcome, job::JobWriteError> {
+        execution_attempt::accept(&self.pool, community_id, event, attempt).await
     }
 
     /// Fetch the current durable state of one delegated job.

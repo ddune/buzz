@@ -2,7 +2,7 @@
 
 ## Status
 
-Buzz extension. Normative for delegated executable work represented by kinds `43001–43006`.
+Buzz extension. Normative for delegated executable work represented by kinds `43001–43007`.
 
 ## Purpose and boundary
 
@@ -20,6 +20,7 @@ An accepted delegated job is the structural input from which BTOM may create a d
 | `43004` | `KIND_JOB_COMPLETED` | Accepted job completed; terminal |
 | `43005` | `KIND_JOB_BLOCKED` | Accepted job blocked; terminal |
 | `43006` | `KIND_JOB_DELEGATED` | Accepted job delegated/transferred; terminal |
+| `43007` | `KIND_JOB_EXECUTION_ATTEMPT` | Runtime attempt/continuation metadata subordinate to an accepted job |
 
 All events are regular append-only stored events. The relay materializes the current state transactionally for deterministic queries and restart recovery; lifecycle history remains in the signed event log.
 
@@ -58,6 +59,20 @@ Lifecycle events must be authored by the original target agent. They cannot rede
 For acceptance or rejection, `job-parent` is the request event. For completion, blocked, or delegation, it is the acceptance event. The relay compares this reference with the atomically locked current head, so same-second events and competing branches cannot be ordered by client timestamps or both commit. Terminal CLI commands require `--parent <acceptance-event-id>`.
 
 `43006` additionally requires exactly one `job-successor` 64-hex managed-agent pubkey. The successor must be managed by the original requester. Other lifecycle kinds forbid `job-successor`. The original job closes as delegated/transferred; a successor's executable work requires a separately requested and accepted child job rather than mutation of the original identity.
+
+## Execution obligation and attempts (`43007`)
+
+An accepted, non-terminal delegated job is the durable execution obligation. No attempt event may independently open, complete, block, reject, or transfer that obligation. Runtime attempts are subordinate metadata keyed by the immutable job `d` coordinate.
+
+Every attempt event is authored by the target agent and carries exactly one `d`, `job-request`, `attempt`, `generation`, `job-target`, `h`, and `attempt-action`. Generation starts at one and increases monotonically. The legal attempt actions are:
+
+- `runnable`: creates the single continuation entitlement for a generation;
+- `claim`: binds that entitlement to one `turn-id`, optional `session-id`, and future `lease-until`, referencing the runnable event with `attempt-parent`;
+- `finish`: records a bounded `attempt-outcome` and optional diagnostic content, referencing the claim event with `attempt-parent` and the same `turn-id`.
+
+The relay serializes attempt changes under the delegated job's community/job advisory lock. A generation is unique per job and an attempt ID is unique per community. A valid runnable or active attempt prevents another generation; an expired claim or finished attempt permits exactly the next generation. Repeated reconciliation without intervening state therefore changes nothing. A terminal job transition suppresses any runnable or active attempt in the same transaction, and an attempt finish never changes job disposition.
+
+Normal ACP return, `EndTurn`, stop, cancellation, cancel-and-merge, session replacement, worker loss, teardown, max-turn exhaustion, timeout, and recoverable provider failure are attempt outcomes only. If the job remains accepted, reconciliation creates exactly one next runnable generation. Only kinds `43004`, `43005`, and `43006` provide terminal BTOM disposition.
 
 ## State machine
 

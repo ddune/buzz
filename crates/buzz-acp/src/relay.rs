@@ -454,6 +454,38 @@ impl RestClient {
             .map_err(|e| RelayError::Http(e.to_string()))
     }
 
+    /// Query every event matching one filter using the relay bridge's stable
+    /// `(until, before_id)` cursor. Recovery callers must not silently forget
+    /// old durable work after an arbitrary first-page limit.
+    pub async fn query_all(&self, filter: &nostr::Filter) -> Result<Vec<Event>, RelayError> {
+        const PAGE_SIZE: usize = 500;
+        let mut filter = serde_json::to_value(filter)
+            .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
+        let mut events = Vec::new();
+        loop {
+            filter["limit"] = serde_json::json!(PAGE_SIZE);
+            let body = serde_json::json!([filter.clone()]);
+            let body_bytes = serde_json::to_vec(&body)
+                .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
+            let resp = self.bridge_post("/query", &body_bytes).await?;
+            let page: Vec<Event> = resp
+                .json()
+                .await
+                .map_err(|e| RelayError::Http(e.to_string()))?;
+            let done = page.len() < PAGE_SIZE;
+            if !done {
+                let last = page.last().expect("a full page has a final event");
+                filter["until"] = serde_json::json!(last.created_at.as_secs());
+                filter["before_id"] = serde_json::json!(last.id.to_hex());
+            }
+            events.extend(page);
+            if done {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
     /// Count events via the HTTP bridge: `POST /count` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
@@ -525,6 +557,12 @@ pub enum RelayError {
 impl From<nostr::event::builder::Error> for RelayError {
     fn from(e: nostr::event::builder::Error) -> Self {
         RelayError::AuthFailed(e.to_string())
+    }
+}
+
+impl From<nostr::event::tag::Error> for RelayError {
+    fn from(error: nostr::event::tag::Error) -> Self {
+        RelayError::Http(format!("event tag error: {error}"))
     }
 }
 

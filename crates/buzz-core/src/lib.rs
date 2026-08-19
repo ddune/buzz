@@ -18,6 +18,8 @@ pub mod engram;
 pub mod error;
 /// Relay-side event wrapper with verification tracking.
 pub mod event;
+/// Durable execution-attempt metadata subordinate to delegated jobs.
+pub mod execution_attempt;
 /// NIP-01 subscription filter matching.
 pub mod filter;
 /// Git permission types — ref patterns, protection rules, policy evaluation.

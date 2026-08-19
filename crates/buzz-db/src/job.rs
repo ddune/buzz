@@ -181,6 +181,16 @@ pub async fn accept_lifecycle(
     .bind(successor)
     .execute(&mut *tx)
     .await?;
+    if lifecycle.action.is_terminal() {
+        sqlx::query(
+            "UPDATE job_execution_attempts SET status='suppressed', updated_at=now() \
+             WHERE community_id=$1 AND job_id=$2 AND status IN ('runnable','active')",
+        )
+        .bind(community.as_uuid())
+        .bind(lifecycle.job_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(inserted_outcome(event, lifecycle.channel_id))
 }
@@ -224,7 +234,7 @@ pub async fn list_jobs_for_agent(
     rows.into_iter().map(row_to_record).collect()
 }
 
-async fn lock_job(
+pub(crate) async fn lock_job(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community: CommunityId,
     job_id: Uuid,
@@ -244,7 +254,7 @@ async fn lock_job(
     Ok(())
 }
 
-async fn load_job_for_update(
+pub(crate) async fn load_job_for_update(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community: CommunityId,
     job_id: Uuid,
@@ -278,7 +288,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> crate::Result<JobRecord> {
     })
 }
 
-async fn event_exists(
+pub(crate) async fn event_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community: CommunityId,
     event: &Event,
@@ -290,7 +300,7 @@ async fn event_exists(
         .await
 }
 
-async fn insert_event(
+pub(crate) async fn insert_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community: CommunityId,
     event: &Event,
@@ -328,13 +338,13 @@ async fn insert_event(
     Ok(())
 }
 
-fn event_timestamp(event: &Event) -> Result<DateTime<Utc>, JobWriteError> {
+pub(crate) fn event_timestamp(event: &Event) -> Result<DateTime<Utc>, JobWriteError> {
     DateTime::from_timestamp(event.created_at.as_secs() as i64, 0).ok_or_else(|| {
         JobWriteError::Database(DbError::InvalidTimestamp(event.created_at.as_secs() as i64))
     })
 }
 
-fn inserted_outcome(event: &Event, channel_id: Uuid) -> JobWriteOutcome {
+pub(crate) fn inserted_outcome(event: &Event, channel_id: Uuid) -> JobWriteOutcome {
     JobWriteOutcome {
         stored_event: StoredEvent::with_received_at(
             event.clone(),
@@ -346,7 +356,7 @@ fn inserted_outcome(event: &Event, channel_id: Uuid) -> JobWriteOutcome {
     }
 }
 
-fn replay_outcome(event: &Event, channel_id: Uuid) -> JobWriteOutcome {
+pub(crate) fn replay_outcome(event: &Event, channel_id: Uuid) -> JobWriteOutcome {
     JobWriteOutcome {
         stored_event: StoredEvent::with_received_at(
             event.clone(),

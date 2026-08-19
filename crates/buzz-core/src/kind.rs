@@ -526,6 +526,8 @@ pub const KIND_JOB_COMPLETED: u32 = 43004;
 pub const KIND_JOB_BLOCKED: u32 = 43005;
 /// The target agent delegated/transferred an accepted job to a successor.
 pub const KIND_JOB_DELEGATED: u32 = 43006;
+/// Durable execution-attempt control for an accepted delegated job.
+pub const KIND_JOB_EXECUTION_ATTEMPT: u32 = 43007;
 
 /// Relay-signed notification: the target pubkey was added to a channel.
 /// Stored globally (channel_id = None) with p-tag = target, h-tag = channel UUID.
