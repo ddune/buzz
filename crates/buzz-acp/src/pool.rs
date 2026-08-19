@@ -1330,7 +1330,16 @@ fn mcp_servers_with_git_origin(
         for server in &mut servers {
             server.name = match capability_profile {
                 SessionCapabilityProfile::JobDecision => "buzz-dev-mcp-job-decision".into(),
-                SessionCapabilityProfile::JobFollowupReadonly => "buzz-dev-mcp-job-followup".into(),
+                SessionCapabilityProfile::JobFollowupReadonly => {
+                    // Hermes keeps MCP registrations process-global and treats
+                    // a repeated name as an idempotent lookup. Include the
+                    // exact reply-authority batch in the registration identity
+                    // so a later follow-up cannot reuse stale environment.
+                    use sha2::{Digest, Sha256};
+                    let authority = followup_reply_event_ids.join(",");
+                    let digest = Sha256::digest(authority.as_bytes());
+                    format!("buzz-dev-mcp-job-followup-{}", hex::encode(&digest[..12]))
+                }
                 _ => server.name.clone(),
             };
         }
@@ -5016,7 +5025,7 @@ mod tests {
         );
 
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "buzz-dev-mcp-job-followup");
+        assert!(servers[0].name.starts_with("buzz-dev-mcp-job-followup-"));
         assert!(servers[0]
             .env
             .iter()
@@ -5030,6 +5039,19 @@ mod tests {
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(!servers[0].env.iter().any(|entry| entry.name == name));
         }
+
+        let later = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(channel),
+            Some("stream"),
+            None,
+            SessionCapabilityProfile::JobFollowupReadonly,
+            &["ef".repeat(32)],
+        );
+        assert_ne!(servers[0].name, later[0].name);
+        assert!(later[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS" && entry.value == "ef".repeat(32)
+        }));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):

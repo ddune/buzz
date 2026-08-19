@@ -2910,6 +2910,43 @@ async fn ingest_event_inner(
         });
     }
 
+    if kind_u32 == KIND_JOB_SUPPLEMENTAL_CONTEXT {
+        let supplemental = buzz_core::supplemental_context::parse_supplemental_context(&event)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        let outcome = state
+            .db
+            .accept_job_supplemental_context(tenant.community(), &event, &supplemental)
+            .await
+            .map_err(|error| match error {
+                buzz_db::job::JobWriteError::Rejected(reason) => {
+                    IngestError::Rejected(format!("invalid: {reason}"))
+                }
+                buzz_db::job::JobWriteError::Database(error) => {
+                    IngestError::Internal(format!("error: {error}"))
+                }
+            })?;
+        if outcome.was_inserted {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &outcome.stored_event,
+                kind_u32,
+                &event.pubkey.to_hex(),
+                threaded_visibility.clone(),
+            )
+            .await;
+        }
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: if outcome.was_inserted {
+                String::new()
+            } else {
+                "duplicate: identical event".into()
+            },
+        });
+    }
+
     if kind_u32 == super::push_lease::KIND_PUSH_LEASE {
         let outcome = super::push_lease::accept(tenant, state, &event, now)
             .await

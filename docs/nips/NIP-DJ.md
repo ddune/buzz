@@ -2,7 +2,7 @@
 
 ## Status
 
-Buzz extension. Normative for delegated executable work represented by kinds `43001–43007`.
+Buzz extension. Normative for delegated executable work represented by kinds `43001–43008`.
 
 ## Purpose and boundary
 
@@ -21,6 +21,7 @@ An accepted delegated job is the structural input from which BTOM may create a d
 | `43005` | `KIND_JOB_BLOCKED` | Accepted job blocked; terminal |
 | `43006` | `KIND_JOB_DELEGATED` | Accepted job delegated/transferred; terminal |
 | `43007` | `KIND_JOB_EXECUTION_ATTEMPT` | Runtime attempt/continuation metadata subordinate to an accepted job |
+| `43008` | `KIND_JOB_SUPPLEMENTAL_CONTEXT` | Target admission of one exact source message for a continuation generation |
 
 All events are regular append-only stored events. The relay materializes the current state transactionally for deterministic queries and restart recovery; lifecycle history remains in the signed event log.
 
@@ -73,6 +74,12 @@ Every attempt event is authored by the target agent and carries exactly one `d`,
 The relay serializes attempt changes under the delegated job's community/job advisory lock. A generation is unique per job and an attempt ID is unique per community. A valid runnable or active attempt prevents another generation; an expired claim or finished attempt permits exactly the next generation. Repeated reconciliation without intervening state therefore changes nothing. A terminal job transition suppresses any runnable or active attempt in the same transaction, and an attempt finish never changes job disposition.
 
 Normal ACP return, `EndTurn`, stop, cancellation, cancel-and-merge, session replacement, worker loss, teardown, max-turn exhaustion, timeout, and recoverable provider failure are attempt outcomes only. If the job remains accepted, reconciliation creates exactly one next runnable generation. Only kinds `43004`, `43005`, and `43006` provide terminal BTOM disposition.
+
+## Supplemental context (`43008`)
+
+When an admitted ordinary message arrives while an accepted job owns the channel, ACP signs a supplemental-context event before the message can affect a runtime session. Required tags are `d`, `job-request`, `job-target`, `h`, `supplemental-event`, `supplemental-author`, and positive `continuation-generation`, each exactly once with two elements. JSON content contains one `content` string copied from the source event.
+
+The relay accepts the event only from the accepted job target, while the job remains accepted, with immutable request/channel coordinates. The exact source event must already exist in the same channel and its author and content must match. The target generation must be the current or immediately succeeding generation. These events are append-only control evidence and are not conversational input.
 
 ## State machine
 

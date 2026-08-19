@@ -237,7 +237,13 @@ fn restricted_shell_words(command: &str) -> Option<Vec<String>> {
                 '\'' => quote = Quote::Single,
                 '"' => quote = Quote::Double,
                 '\\' => escaped = true,
-                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '#' => return None,
+                // Reject every unquoted shell expansion/operator character,
+                // not just command separators. The validated argv is later
+                // executed by bash, so brace/glob/tilde/history expansion
+                // would otherwise be able to manufacture extra CLI options
+                // after this check (for example `{ok,--file=/etc/passwd}`).
+                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '#' | '{' | '}' | '*' | '?' | '['
+                | ']' | '~' | '(' | ')' | '!' => return None,
                 ch if ch.is_whitespace() => {
                     if !word.is_empty() {
                         words.push(std::mem::take(&mut word));
@@ -438,6 +444,8 @@ mod evaluation_tests {
             format!("buzz messages send --channel {channel} --content ok --reply-to {event} --kind=9"),
             format!("buzz messages send --channel {channel} --content ok --reply-to {wrong_event}"),
             format!("buzz messages send --channel {channel} --content ok # --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content {{ok,--file=/etc/hostname}} --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content * --reply-to {event}"),
             format!("buzz messages send --channel {channel} --content ok --reply-to {event} --reply-to {event}"),
             format!("buzz messages send --channel 00000000-0000-0000-0000-000000000099 --content ok --reply-to {event}"),
             format!("buzz messages send --channel {channel} --content 'ok'; touch marker --reply-to {event}"),

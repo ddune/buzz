@@ -133,7 +133,7 @@ The `kind` integer is the only dispatch switch. The relay routes, stores, and fa
 | 9 | KIND_STREAM_MESSAGE | Chat message in a Stream channel (NIP-29 group chat) |
 | 40002 | KIND_STREAM_MESSAGE_V2 | Stream message v2 format |
 | 40003 | KIND_STREAM_MESSAGE_EDIT | Edit of a stream message |
-| 43001–43007 | KIND_JOB_* | Delegated-job lifecycle plus subordinate execution-attempt control ([NIP-DJ](docs/nips/NIP-DJ.md)) |
+| 43001–43008 | KIND_JOB_* | Delegated-job lifecycle, execution attempts, and admitted supplemental context ([NIP-DJ](docs/nips/NIP-DJ.md)) |
 | 45001 | KIND_FORUM_POST | Forum thread root |
 | 45003 | KIND_FORUM_COMMENT | Forum thread reply |
 | 46001–46012 | KIND_WORKFLOW_* | Workflow execution events |

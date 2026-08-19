@@ -3145,6 +3145,14 @@ async fn tokio_main() -> Result<()> {
                             // A failed attestation is fail-closed: the active
                             // execution is left untouched and no untracked
                             // replacement receives the message.
+                            if queue.accepted_job_channel_is_ambiguous(buzz_event.channel_id) {
+                                tracing::error!(
+                                    channel_id = %buzz_event.channel_id,
+                                    source_event_id = %buzz_event.event.id,
+                                    "dropping supplemental event because accepted-job channel ownership is ambiguous"
+                                );
+                                continue;
+                            }
                             if let Some(guard) =
                                 queue.accepted_job_guard(buzz_event.channel_id).cloned()
                             {
@@ -3461,6 +3469,22 @@ async fn tokio_main() -> Result<()> {
                             .get(&evaluation.channel_id)
                             .cloned()
                     });
+                let completed_followup = pool
+                    .task_map()
+                    .values()
+                    .find(|meta| meta.agent_index == result.agent.index)
+                    .and_then(|meta| meta.recoverable_batch.as_ref())
+                    .and_then(|batch| {
+                        batch.events.iter().find_map(|event| {
+                            job_execution::followup_from_prompt_tag(&event.prompt_tag).map(
+                                |followup| job_execution::JobEvaluationContext {
+                                    job_id: followup.job_id,
+                                    request_event_id: followup.request_event_id,
+                                    channel_id: batch.channel_id,
+                                },
+                            )
+                        })
+                    });
                 if let Some(attempt_id) = pool
                     .task_map()
                     .values()
@@ -3508,6 +3532,23 @@ async fn tokio_main() -> Result<()> {
                         config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
                     )
                     .await;
+                }
+                if let Some(evaluation) = completed_followup {
+                    if !queue.has_outstanding_followup_for_job(evaluation.job_id) {
+                        tracing::info!(
+                            job_id = %evaluation.job_id,
+                            channel_id = %evaluation.channel_id,
+                            "restricted follow-up boundary ended; reconciling sole durable continuation"
+                        );
+                        promote_accepted_job(
+                            &ctx.rest_client,
+                            &mut queue,
+                            &mut queued_job_attempts,
+                            &evaluation,
+                            config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                        )
+                        .await;
+                    }
                 }
                 let (drain_action, panicked_evaluations) = drain_ready_join_results(
                     &mut pool,
@@ -4418,24 +4459,10 @@ fn enqueue_job_continuations(
             tracing::warn!(%attempt_id, "dropping continuation with malformed request root");
             continue;
         };
-        let followup = job_execution::JobFollowupContext {
-            job_id: continuation.execution.job_id,
-            request_event_id: continuation.execution.request_event_id.clone(),
-            interrupted_attempt_id: None,
-            interrupted_generation: continuation.execution.generation.checked_sub(1),
-            interrupted_turn_id: None,
-        };
-        let followup_tag = job_execution::followup_prompt_tag(&followup);
-        if let Ok(followup_tag) = followup_tag {
-            for event in &continuation.unanswered_supplemental_events {
-                queue.push(QueuedEvent {
-                    channel_id,
-                    event: event.clone(),
-                    received_at: std::time::Instant::now(),
-                    prompt_tag: followup_tag.clone(),
-                });
-            }
-        }
+        // A restricted conversational reply is offered only on the live
+        // ingress path. Recovery never replays it ahead of a durable claim:
+        // the reply is optional, while the admitted message itself is carried
+        // in supplemental_messages and must not delay execution authority.
         queue.push_durable_continuation(QueuedEvent {
             channel_id,
             event: continuation.request,

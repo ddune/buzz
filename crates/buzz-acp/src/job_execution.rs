@@ -8,6 +8,9 @@ use buzz_core::kind::{
     KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED, KIND_JOB_DELEGATED,
     KIND_JOB_EXECUTION_ATTEMPT, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_JOB_SUPPLEMENTAL_CONTEXT,
 };
+use buzz_core::supplemental_context::{
+    parse_supplemental_context, SupplementalContextEvent as SupplementalAdmission,
+};
 use nostr::{Event, EventBuilder, Filter, Kind, Tag};
 use uuid::Uuid;
 
@@ -159,9 +162,6 @@ pub struct ContinuationWork {
     pub execution: JobExecutionContext,
     /// Relay-recovered context for the interrupted generation.
     pub supplemental_messages: Vec<JobSupplementalMessage>,
-    /// Exact admitted source events still eligible for an optional restricted
-    /// conversational reply. These never carry execution authority.
-    pub unanswered_supplemental_events: Vec<Event>,
 }
 
 /// One authoritative reconciliation snapshot. Guards are returned even when
@@ -256,20 +256,22 @@ pub async fn reconcile(
         deferred_channels,
         lease_seconds,
         events,
+        None,
     )
     .await
 }
 
 /// Reconcile one accepted job through the same canonical state machine used by
-/// broad startup/periodic recovery. Exact `#d` filters keep the decision-driven
-/// path independent of unrelated portfolio volume and pagination.
+/// broad startup/periodic recovery. The broad ownership projection is
+/// intentional: a supposedly exact job may not claim a channel when another
+/// accepted job already owns that same channel.
 pub async fn reconcile_job(
     rest: &RestClient,
     already_queued: &HashSet<Uuid>,
     lease_seconds: u64,
     evaluation: &JobEvaluationContext,
 ) -> Result<JobReconcileResult, RelayError> {
-    let events = query_events(rest, Some(evaluation.job_id)).await?;
+    let events = query_events(rest, None).await?;
     let queried_events = events.len();
     let attempts = events
         .iter()
@@ -292,9 +294,16 @@ pub async fn reconcile_job(
         "exact delegated-job reconciliation snapshot"
     );
     let work = if state.is_some() {
-        reconcile_events(rest, already_queued, &HashSet::new(), lease_seconds, events)
-            .await?
-            .work
+        reconcile_events(
+            rest,
+            already_queued,
+            &HashSet::new(),
+            lease_seconds,
+            events,
+            Some(evaluation.job_id),
+        )
+        .await?
+        .work
     } else {
         Vec::new()
     };
@@ -341,8 +350,21 @@ async fn reconcile_events(
     deferred_channels: &HashSet<Uuid>,
     lease_seconds: u64,
     events: Vec<Event>,
+    only_job_id: Option<Uuid>,
 ) -> Result<ReconcileSnapshot, RelayError> {
     let jobs = project_jobs(&events);
+
+    // Relay schema permits more than one accepted job in a channel. ACP has
+    // only one serial execution lane per channel, so fail closed instead of
+    // nondeterministically assigning that lane to one of multiple owners.
+    let mut accepted_channel_counts = HashMap::<Uuid, usize>::new();
+    for job in jobs.values().filter(|job| job.state == JobState::Accepted) {
+        if let Ok(request) = parse_job_request(&job.request) {
+            *accepted_channel_counts
+                .entry(request.channel_id)
+                .or_default() += 1;
+        }
+    }
 
     let mut attempts: HashMap<
         Uuid,
@@ -379,16 +401,33 @@ async fn reconcile_events(
             channel_id: request.channel_id,
             last_execution: latest_execution_context(&history),
         });
+        if only_job_id.is_some_and(|only| only != job_id) {
+            continue;
+        }
+        if accepted_channel_counts
+            .get(&request.channel_id)
+            .copied()
+            .unwrap_or_default()
+            != 1
+        {
+            tracing::error!(
+                job_id = %job_id,
+                channel_id = %request.channel_id,
+                "refusing delegated-job claim because multiple accepted jobs own one channel"
+            );
+            continue;
+        }
         if deferred_channels.contains(&request.channel_id) {
             continue;
         }
         let next = reconcile_decision(&history, chrono::Utc::now().timestamp());
         let continuation_generation = match next {
             ReconcileDecision::Use(index) => history[index].1.generation,
+            ReconcileDecision::Recover { runnable, .. } => history[runnable].1.generation,
             ReconcileDecision::Create(generation) => generation,
             ReconcileDecision::None => continue,
         };
-        let (supplemental_messages, unanswered_supplemental_events) =
+        let (supplemental_messages, _unanswered_supplemental_events) =
             recover_supplemental_messages(
                 rest,
                 request.channel_id,
@@ -399,6 +438,7 @@ async fn reconcile_events(
             .await?;
         let (runnable_event, runnable) = match next {
             ReconcileDecision::Use(index) => history[index].clone(),
+            ReconcileDecision::Recover { runnable, .. } => history[runnable].clone(),
             ReconcileDecision::Create(generation) => {
                 let attempt_id = Uuid::new_v4();
                 let event = build_runnable(rest, &request, attempt_id, generation)?;
@@ -417,6 +457,39 @@ async fn reconcile_events(
             ReconcileDecision::None => continue,
         };
         if already_queued.contains(&runnable.attempt_id) {
+            continue;
+        }
+        if let ReconcileDecision::Recover { claim, .. } = next {
+            let (claim_event, claim) = &history[claim];
+            let Some(turn_id) = claim.turn_id.clone() else {
+                continue;
+            };
+            let Some(lease_until) = claim.lease_until else {
+                continue;
+            };
+            tracing::warn!(
+                job_id = %job_id,
+                attempt_id = %runnable.attempt_id,
+                generation = runnable.generation,
+                claim_event_id = %claim_event.id,
+                %turn_id,
+                lease_until,
+                "recovering durably claimed but locally undispatched generation"
+            );
+            work.push(ContinuationWork {
+                request: job.request,
+                execution: JobExecutionContext {
+                    job_id,
+                    request_event_id: runnable.request_event_id,
+                    attempt_id: runnable.attempt_id,
+                    generation: runnable.generation,
+                    runnable_event_id: runnable_event.id.to_hex(),
+                    claim_event_id: claim_event.id.to_hex(),
+                    turn_id,
+                    lease_until,
+                },
+                supplemental_messages,
+            });
             continue;
         }
         let turn_id = Uuid::new_v4().to_string();
@@ -458,7 +531,6 @@ async fn reconcile_events(
                 ..execution
             },
             supplemental_messages,
-            unanswered_supplemental_events,
         });
     }
     Ok(ReconcileSnapshot {
@@ -501,19 +573,8 @@ struct FollowupBoundaryDetail {
     supplemental_event_id: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct SupplementalAdmissionContent {
-    content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SupplementalAdmission {
-    job_id: Uuid,
-    request_event_id: String,
-    channel_id: Uuid,
-    source_event_id: String,
-    source_author: String,
-    continuation_generation: i64,
     content: String,
 }
 
@@ -553,67 +614,7 @@ pub async fn persist_supplemental_admission(
 }
 
 fn parse_supplemental_admission(event: &Event) -> Result<SupplementalAdmission, RelayError> {
-    if event.kind.as_u16() as u32 != KIND_JOB_SUPPLEMENTAL_CONTEXT {
-        return Err(RelayError::Http("not supplemental context".into()));
-    }
-    let one = |name: &str| -> Result<String, RelayError> {
-        let values: Vec<String> = event
-            .tags
-            .iter()
-            .filter_map(|tag| {
-                let parts = tag.as_slice();
-                (parts.first().map(String::as_str) == Some(name))
-                    .then(|| parts.get(1).cloned())
-                    .flatten()
-            })
-            .collect();
-        if values.len() == 1 {
-            Ok(values[0].clone())
-        } else {
-            Err(RelayError::Http(format!(
-                "supplemental context requires exactly one {name} tag"
-            )))
-        }
-    };
-    let job_id = Uuid::parse_str(&one("d")?)
-        .map_err(|error| RelayError::Http(format!("invalid supplemental job id: {error}")))?;
-    let channel_id = Uuid::parse_str(&one("h")?)
-        .map_err(|error| RelayError::Http(format!("invalid supplemental channel: {error}")))?;
-    let continuation_generation = one("continuation-generation")?
-        .parse::<i64>()
-        .map_err(|error| RelayError::Http(format!("invalid continuation generation: {error}")))?;
-    if continuation_generation < 1 {
-        return Err(RelayError::Http(
-            "continuation generation must be positive".into(),
-        ));
-    }
-    let target = one("job-target")?;
-    if target != event.pubkey.to_hex() {
-        return Err(RelayError::Http(
-            "supplemental job-target must match signer".into(),
-        ));
-    }
-    let source_event_id = one("supplemental-event")?;
-    let source_author = one("supplemental-author")?;
-    if !is_hex_64(&source_event_id) || !is_hex_64(&source_author) {
-        return Err(RelayError::Http(
-            "invalid supplemental event or author identity".into(),
-        ));
-    }
-    let content: SupplementalAdmissionContent = serde_json::from_str(&event.content)?;
-    Ok(SupplementalAdmission {
-        job_id,
-        request_event_id: one("job-request")?,
-        channel_id,
-        source_event_id,
-        source_author,
-        continuation_generation,
-        content: content.content,
-    })
-}
-
-fn is_hex_64(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    parse_supplemental_context(event).map_err(|error| RelayError::Http(error.to_string()))
 }
 
 pub fn followup_boundary_detail(event_id: &str) -> Result<String, serde_json::Error> {
@@ -700,6 +701,7 @@ fn project_admitted_supplemental(
 enum ReconcileDecision {
     None,
     Use(usize),
+    Recover { runnable: usize, claim: usize },
     Create(i64),
 }
 
@@ -720,12 +722,12 @@ fn reconcile_decision(
         return ReconcileDecision::None;
     };
     let runnable_id = runnable_event.id.to_hex();
-    let claim = history.iter().find(|(_, attempt)| {
+    let claim = history.iter().enumerate().find(|(_, (_, attempt))| {
         attempt.generation == generation
             && attempt.action == AttemptAction::Claim
             && attempt.parent_event_id.as_deref() == Some(runnable_id.as_str())
     });
-    let Some((claim_event, claim)) = claim else {
+    let Some((claim_index, (claim_event, claim))) = claim else {
         return ReconcileDecision::Use(runnable_index);
     };
     let claim_id = claim_event.id.to_hex();
@@ -738,7 +740,10 @@ fn reconcile_decision(
     if finished || claim.lease_until.is_some_and(|lease| lease <= now) {
         ReconcileDecision::Create(generation + 1)
     } else {
-        ReconcileDecision::None
+        ReconcileDecision::Recover {
+            runnable: runnable_index,
+            claim: claim_index,
+        }
     }
 }
 
@@ -885,7 +890,11 @@ mod tests {
         active.1.parent_event_id = Some(runnable.0.id.to_hex());
         assert_eq!(
             reconcile_decision(&[active.clone(), runnable.clone()], 10),
-            ReconcileDecision::None
+            ReconcileDecision::Recover {
+                runnable: 1,
+                claim: 0
+            },
+            "restart recovery must reuse the live durable claim"
         );
         assert_eq!(
             reconcile_decision(&[runnable.clone(), active.clone()], 21),
