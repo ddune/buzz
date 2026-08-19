@@ -1291,6 +1291,15 @@ fn mcp_servers_with_git_origin(
         // honor Buzz's evaluation-only environment. Keep only the bundled
         // server whose handlers enforce the restricted tool boundary.
         servers.retain(|server| server.command == "buzz-dev-mcp");
+        // Hermes registers ACP-provided MCP processes globally by server name
+        // and intentionally treats a repeated name as an idempotent lookup.
+        // Give the fail-closed evaluation process its own registry identity so
+        // a later execution session cannot reuse its evaluation-only
+        // environment. The executable identity remains exact and trusted; only
+        // the ACP registration name is separated from normal execution.
+        for server in &mut servers {
+            server.name = "buzz-dev-mcp-job-decision".into();
+        }
     }
     let origin = match (channel_id, channel_type) {
         (Some(channel_id), Some("stream")) => Some(EnvVar {
@@ -4756,7 +4765,7 @@ mod tests {
 
     fn test_mcp_server() -> McpServer {
         McpServer {
-            name: "dev".into(),
+            name: "buzz-dev-mcp".into(),
             command: "buzz-dev-mcp".into(),
             args: vec![],
             env: vec![],
@@ -4859,11 +4868,38 @@ mod tests {
         );
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].command, "buzz-dev-mcp");
+        assert_eq!(servers[0].name, "buzz-dev-mcp-job-decision");
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(servers[0]
                 .env
                 .iter()
                 .any(|entry| entry.name == name && entry.value == "1"));
+        }
+    }
+
+    #[test]
+    fn execution_uses_a_distinct_unrestricted_mcp_registration() {
+        let evaluation = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(Uuid::new_v4()),
+            Some("stream"),
+            None,
+            true,
+        );
+        let execution = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(Uuid::new_v4()),
+            Some("stream"),
+            None,
+            false,
+        );
+
+        assert_eq!(evaluation[0].command, execution[0].command);
+        assert_ne!(evaluation[0].name, execution[0].name);
+        assert_eq!(execution[0].name, "buzz-dev-mcp");
+        for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
+            assert!(evaluation[0].env.iter().any(|entry| entry.name == name));
+            assert!(!execution[0].env.iter().any(|entry| entry.name == name));
         }
     }
 
