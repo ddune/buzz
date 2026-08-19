@@ -369,10 +369,12 @@ mod tests {
     async fn fixture() -> (PgPool, CommunityId, Uuid) {
         let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
         let pool = PgPool::connect(&url).await.expect("connect test DB");
-        crate::Db::from_pool(pool.clone())
-            .migrate()
-            .await
-            .expect("migrate test DB");
+        if std::env::var_os("BUZZ_TEST_SCHEMA_READY").is_none() {
+            crate::Db::from_pool(pool.clone())
+                .migrate()
+                .await
+                .expect("migrate test DB");
+        }
         let community_id = Uuid::new_v4();
         let channel_id = Uuid::new_v4();
         let creator = Keys::generate().public_key().to_bytes();

@@ -733,6 +733,7 @@ jobs:
             --run-ignored ignored-only
         env:
           TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          BUZZ_TEST_SCHEMA_READY: "true"
       - name: Delegated-job relay query pushdown test
         # The job history query must apply its indexed #d predicate before SQL
         # LIMIT, including though 43001-43006 are append-only rather than NIP-33.
