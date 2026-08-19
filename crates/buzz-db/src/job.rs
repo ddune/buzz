@@ -463,6 +463,14 @@ mod tests {
                 .expect("replay")
                 .was_inserted
         );
+        let indexed_job_id: Option<String> =
+            sqlx::query_scalar("SELECT d_tag FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(event.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("query indexed job id");
+        assert_eq!(indexed_job_id.as_deref(), Some(job.to_string().as_str()));
 
         let conflict = request_event(&requester, &target, job, channel, "different assignment");
         let conflict_parsed = parse_job_request(&conflict).expect("parse conflict");

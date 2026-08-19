@@ -207,6 +207,210 @@ async fn create_test_channel(keys: &Keys) -> String {
     channel_uuid.to_string()
 }
 
+async fn seed_managed_agent_in_channel(owner: &Keys, agent: &Keys, channel_id: &str) {
+    let pool = e2e_db_pool().await;
+    let community_id = ensure_test_community(&relay_authority()).await;
+    let owner_pubkey = owner.public_key().to_bytes();
+    let agent_pubkey = agent.public_key().to_bytes();
+    sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(community_id)
+        .bind(owner_pubkey.as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed job owner");
+    sqlx::query(
+        "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) VALUES ($1, $2, $3) \
+         ON CONFLICT (community_id, pubkey) DO UPDATE SET agent_owner_pubkey = EXCLUDED.agent_owner_pubkey",
+    )
+    .bind(community_id)
+    .bind(agent_pubkey.as_slice())
+    .bind(owner_pubkey.as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed managed agent");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+         VALUES ($1, $2, $3, 'member', $4) \
+         ON CONFLICT (community_id, channel_id, pubkey) DO UPDATE SET removed_at = NULL",
+    )
+    .bind(community_id)
+    .bind(Uuid::parse_str(channel_id).expect("channel UUID"))
+    .bind(agent_pubkey.as_slice())
+    .bind(owner_pubkey.as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed managed agent membership");
+}
+
+fn delegated_job_lifecycle_event(
+    author: &Keys,
+    kind: u16,
+    job_id: Uuid,
+    request: &nostr::Event,
+    parent: &nostr::Event,
+    channel_id: &str,
+) -> nostr::Event {
+    EventBuilder::new(Kind::Custom(kind), "state change")
+        .tags([
+            Tag::parse(["d", &job_id.to_string()]).unwrap(),
+            Tag::parse(["job-request", &request.id.to_hex()]).unwrap(),
+            Tag::parse(["job-parent", &parent.id.to_hex()]).unwrap(),
+            Tag::parse(["h", channel_id]).unwrap(),
+        ])
+        .sign_with_keys(author)
+        .expect("sign delegated-job lifecycle event")
+}
+
+#[tokio::test]
+#[ignore]
+async fn delegated_job_relay_enforces_authority_lifecycle_deletion_and_query() {
+    let owner = Keys::generate();
+    let target = Keys::generate();
+    let outsider = Keys::generate();
+    let channel_id = create_test_channel(&owner).await;
+    seed_managed_agent_in_channel(&owner, &target, &channel_id).await;
+
+    let mut owner_client = BuzzTestClient::connect(&relay_url(), &owner)
+        .await
+        .expect("connect owner");
+    let mut target_client = BuzzTestClient::connect(&relay_url(), &target)
+        .await
+        .expect("connect target");
+    let mut outsider_client = BuzzTestClient::connect(&relay_url(), &outsider)
+        .await
+        .expect("connect outsider");
+
+    let job_id = Uuid::new_v4();
+    let request_tags = [
+        Tag::parse(["d", &job_id.to_string()]).unwrap(),
+        Tag::parse(["job-target", &target.public_key().to_hex()]).unwrap(),
+        Tag::parse(["p", &target.public_key().to_hex()]).unwrap(),
+        Tag::parse(["h", &channel_id]).unwrap(),
+    ];
+    let unauthorized = EventBuilder::new(Kind::Custom(43001), "unauthorized assignment")
+        .tags(request_tags.clone())
+        .sign_with_keys(&outsider)
+        .unwrap();
+    let unauthorized_result = outsider_client
+        .send_event(unauthorized)
+        .await
+        .expect("submit unauthorized request");
+    assert!(!unauthorized_result.accepted, "non-owner request must fail");
+
+    let request = EventBuilder::new(Kind::Custom(43001), "bounded assignment")
+        .tags(request_tags)
+        .sign_with_keys(&owner)
+        .unwrap();
+    assert!(
+        owner_client
+            .send_event(request.clone())
+            .await
+            .expect("submit request")
+            .accepted
+    );
+
+    let forged_accept =
+        delegated_job_lifecycle_event(&outsider, 43002, job_id, &request, &request, &channel_id);
+    assert!(
+        !outsider_client
+            .send_event(forged_accept)
+            .await
+            .expect("submit forged acceptance")
+            .accepted,
+        "non-target acceptance must fail"
+    );
+
+    let premature_complete =
+        delegated_job_lifecycle_event(&target, 43004, job_id, &request, &request, &channel_id);
+    assert!(
+        !target_client
+            .send_event(premature_complete)
+            .await
+            .expect("submit premature completion")
+            .accepted,
+        "completion before acceptance must fail"
+    );
+
+    let accepted =
+        delegated_job_lifecycle_event(&target, 43002, job_id, &request, &request, &channel_id);
+    assert!(
+        target_client
+            .send_event(accepted.clone())
+            .await
+            .expect("accept job")
+            .accepted
+    );
+    assert!(
+        target_client
+            .send_event(accepted.clone())
+            .await
+            .expect("replay acceptance")
+            .accepted,
+        "identical acceptance replay must be harmless"
+    );
+
+    for deletion_kind in [5_u16, 9005_u16] {
+        let mut tags = vec![Tag::parse(["e", &request.id.to_hex()]).unwrap()];
+        if deletion_kind == 9005 {
+            tags.push(Tag::parse(["h", &channel_id]).unwrap());
+        }
+        let deletion = EventBuilder::new(Kind::Custom(deletion_kind), "delete job request")
+            .tags(tags)
+            .sign_with_keys(&owner)
+            .unwrap();
+        assert!(
+            !owner_client
+                .send_event(deletion)
+                .await
+                .expect("submit job deletion")
+                .accepted,
+            "kind {deletion_kind} must not delete job history"
+        );
+    }
+
+    let completed =
+        delegated_job_lifecycle_event(&target, 43004, job_id, &request, &accepted, &channel_id);
+    assert!(
+        target_client
+            .send_event(completed.clone())
+            .await
+            .expect("complete job")
+            .accepted
+    );
+
+    let subscription_id = sub_id("delegated-job-history");
+    let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+    target_client
+        .subscribe(
+            &subscription_id,
+            vec![Filter::new()
+                .kinds([
+                    Kind::Custom(43001),
+                    Kind::Custom(43002),
+                    Kind::Custom(43004),
+                ])
+                .custom_tags(d_tag, [job_id.to_string()])],
+        )
+        .await
+        .expect("subscribe to delegated-job history");
+    let history = target_client
+        .collect_until_eose(&subscription_id, Duration::from_secs(5))
+        .await
+        .expect("collect delegated-job history");
+    assert_eq!(
+        history.len(),
+        3,
+        "request, acceptance, and completion remain queryable"
+    );
+
+    owner_client.disconnect().await.expect("disconnect owner");
+    target_client.disconnect().await.expect("disconnect target");
+    outsider_client
+        .disconnect()
+        .await
+        .expect("disconnect outsider");
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_connect_and_authenticate() {
