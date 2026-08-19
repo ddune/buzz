@@ -397,6 +397,11 @@ mod tests {
     }
 
     async fn cleanup(pool: &PgPool, community: CommunityId) {
+        sqlx::query("DELETE FROM channels WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .execute(pool)
+            .await
+            .expect("cleanup channels");
         sqlx::query("DELETE FROM communities WHERE id=$1")
             .bind(community.as_uuid())
             .execute(pool)
