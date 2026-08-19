@@ -254,7 +254,11 @@ mod evaluation_tests {
         ));
         for command in [
             "git status",
+            "bash -lc 'touch marker'",
+            "python -c 'open(\"marker\", \"w\").close()'",
             "buzz jobs complete --job id",
+            "buzz jobs blocked --job id",
+            "buzz jobs delegate --job id",
             "buzz jobs accept --job id; touch marker",
             "buzz jobs accept --job id && cargo test",
             "buzz jobs accept --content $(touch marker)",

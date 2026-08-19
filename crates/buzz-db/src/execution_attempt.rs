@@ -387,8 +387,9 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn generation_one_is_durable_and_claimed_before_runtime_callback() {
+    async fn acceptance_cancel_release_promotes_and_claims_before_runtime_callback() {
         let (pool, community, channel, _, target, job_id, request, acceptance) = fixture().await;
+        let mut evaluation_in_flight = true;
         job::accept_lifecycle(
             &pool,
             community,
@@ -397,6 +398,10 @@ mod tests {
         )
         .await
         .expect("accept job");
+        assert!(
+            evaluation_in_flight,
+            "acceptance cannot itself start execution"
+        );
 
         let before_attempts: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM job_execution_attempts WHERE community_id=$1 AND job_id=$2",
@@ -410,6 +415,11 @@ mod tests {
             before_attempts, 0,
             "acceptance alone is not an execution attempt"
         );
+
+        // Service-backed stand-in for the ACP Rotate acknowledgement and
+        // EventQueue::mark_complete seam. Promotion is deliberately below it.
+        evaluation_in_flight = false;
+        let promotion_started = std::time::Instant::now();
 
         let attempt_id = Uuid::new_v4();
         let runnable = attempt_event(
@@ -445,6 +455,10 @@ mod tests {
         )
         .await
         .expect("persist generation one claim");
+        assert!(
+            promotion_started.elapsed() < std::time::Duration::from_secs(5),
+            "decision-driven promotion must not depend on the 15-second recovery timer"
+        );
 
         // This closure is the service-backed stand-in for runtime dispatch.
         // It is intentionally invoked only after a read-back proves the
@@ -482,7 +496,10 @@ mod tests {
             .expect("lease")
             .is_some_and(|lease| lease > Utc::now()));
         let mut runtime_callback_fired = false;
-        let runtime_callback = |fired: &mut bool| *fired = true;
+        let runtime_callback = |fired: &mut bool| {
+            assert!(!evaluation_in_flight, "evaluation must be released first");
+            *fired = true;
+        };
         runtime_callback(&mut runtime_callback_fired);
         assert!(runtime_callback_fired);
 

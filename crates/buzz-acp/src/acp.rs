@@ -654,6 +654,7 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
+        hermes_tool_profile: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
@@ -672,6 +673,12 @@ impl AcpClient {
         if let Some(title) = session_title {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if let Some(profile) = hermes_tool_profile {
+            // Hermes ACP extension: this is a session-scoped capability
+            // reduction. Other adapters must ignore unknown _meta fields.
+            params["_meta"]["hermes"]["toolProfile"] =
+                serde_json::Value::String(profile.to_owned());
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -697,7 +704,7 @@ impl AcpClient {
         session_title: Option<&str>,
     ) -> Result<String, AcpError> {
         Ok(self
-            .session_new_full(cwd, mcp_servers, system_prompt, session_title)
+            .session_new_full(cwd, mcp_servers, system_prompt, session_title, None)
             .await?
             .session_id)
     }
@@ -3477,6 +3484,7 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::Field("Custom system prompt")),
                 None,
+                None,
             )
             .await
             .expect("session_new_full should succeed");
@@ -3562,7 +3570,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, None)
+            .session_new_full("/tmp", vec![], None, None, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3590,7 +3598,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
+            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"), None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3599,6 +3607,32 @@ mod tests {
             received["params"]["_meta"]["sessionTitle"].as_str(),
             Some("Fizz · #buzz-dev"),
             "title should ride in _meta.sessionTitle, out of band from the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_full_sends_hermes_decision_only_tool_profile() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let resp = client
+            .session_new_full("/tmp", vec![], None, None, Some("decision-only"))
+            .await
+            .expect("session_new_full should succeed");
+
+        assert_eq!(
+            resp.raw["_receivedRequest"]["params"]["_meta"]["hermes"]["toolProfile"].as_str(),
+            Some("decision-only")
         );
     }
 
@@ -3618,7 +3652,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, None)
+            .session_new_full("/tmp", vec![], None, None, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3653,6 +3687,7 @@ mod tests {
                 "/tmp",
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
+                None,
                 None,
             )
             .await
@@ -3693,6 +3728,7 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
                 Some("Fizz · #buzz-dev"),
+                None,
             )
             .await
             .expect("session_new_full should succeed");

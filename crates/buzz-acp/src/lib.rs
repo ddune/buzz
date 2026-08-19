@@ -2226,6 +2226,7 @@ async fn tokio_main() -> Result<()> {
     });
 
     let mut queued_job_attempts = HashSet::new();
+    let mut pending_job_promotions = HashMap::<Uuid, job_execution::JobEvaluationContext>::new();
     match job_execution::reconcile(
         &ctx.rest_client,
         &queued_job_attempts,
@@ -2818,20 +2819,38 @@ async fn tokio_main() -> Result<()> {
                                             "delegated-job decision closed its evaluation turn"
                                         );
                                         if kind_u32 == KIND_JOB_ACCEPTED {
-                                            match job_execution::reconcile(
-                                                &ctx.rest_client,
-                                                &queued_job_attempts,
-                                                config.max_turn_duration_secs
-                                                    + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
-                                            ).await {
-                                                Ok(work) => enqueue_job_continuations(
+                                            tracing::info!(
+                                                job_id = %evaluation.job_id,
+                                                acceptance_event_id = %buzz_event.event.id,
+                                                channel_id = %evaluation.channel_id,
+                                                channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                                                stopped,
+                                                "matching delegated-job acceptance observed"
+                                            );
+                                            if stopped
+                                                || queue.is_channel_in_flight(evaluation.channel_id)
+                                            {
+                                                pending_job_promotions
+                                                    .insert(evaluation.job_id, evaluation);
+                                            } else {
+                                                promote_accepted_job(
+                                                    &ctx.rest_client,
                                                     &mut queue,
                                                     &mut queued_job_attempts,
-                                                    work,
-                                                ),
-                                                Err(error) => tracing::warn!(
-                                                    "post-accept delegated-job reconciliation failed: {error}"
-                                                ),
+                                                    &evaluation,
+                                                    config.max_turn_duration_secs
+                                                        + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                                                ).await;
+                                                if pool_ready {
+                                                    for (channel_id, thread_tags) in dispatch_pending(
+                                                        &mut pool,
+                                                        &mut queue,
+                                                        &ctx,
+                                                        &mut last_activity,
+                                                    ) {
+                                                        typing_channels.insert(channel_id, thread_tags);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -3305,6 +3324,20 @@ async fn tokio_main() -> Result<()> {
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
+                let completed_evaluation = pool
+                    .task_map()
+                    .values()
+                    .find(|meta| meta.agent_index == result.agent.index)
+                    .and_then(|meta| meta.job_evaluation.clone());
+                let completed_evaluation_session =
+                    completed_evaluation.as_ref().and_then(|evaluation| {
+                        result
+                            .agent
+                            .state
+                            .sessions
+                            .get(&evaluation.channel_id)
+                            .cloned()
+                    });
                 if let Some(attempt_id) = pool
                     .task_map()
                     .values()
@@ -3333,6 +3366,25 @@ async fn tokio_main() -> Result<()> {
                 ) == LoopAction::Exit
                 {
                     break;
+                }
+                if let Some(evaluation) = completed_evaluation.filter(|evaluation| {
+                    pending_job_promotions.remove(&evaluation.job_id).is_some()
+                }) {
+                    tracing::info!(
+                        job_id = %evaluation.job_id,
+                        channel_id = %evaluation.channel_id,
+                        channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                        evaluation_session_id = completed_evaluation_session.as_deref().unwrap_or("<rotated>"),
+                        "evaluation cancellation completed; promoting accepted job"
+                    );
+                    promote_accepted_job(
+                        &ctx.rest_client,
+                        &mut queue,
+                        &mut queued_job_attempts,
+                        &evaluation,
+                        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                    )
+                    .await;
                 }
                 if drain_ready_join_results(
                     &mut pool,
@@ -4015,6 +4067,72 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+async fn promote_accepted_job(
+    rest: &relay::RestClient,
+    queue: &mut EventQueue,
+    queued_attempts: &mut HashSet<Uuid>,
+    evaluation: &job_execution::JobEvaluationContext,
+    lease_seconds: u64,
+) {
+    debug_assert!(!queue.is_channel_in_flight(evaluation.channel_id));
+    const MAX_VISIBILITY_PASSES: usize = 5;
+    for pass in 1..=MAX_VISIBILITY_PASSES {
+        tracing::debug!(
+            job_id = %evaluation.job_id,
+            request_event_id = %evaluation.request_event_id,
+            channel_id = %evaluation.channel_id,
+            pass,
+            channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+            "invoking exact post-evaluation delegated-job reconciliation"
+        );
+        match job_execution::reconcile_job(rest, queued_attempts, lease_seconds, evaluation).await {
+            Ok(result) if !result.work.is_empty() => {
+                let count = result.work.len();
+                enqueue_job_continuations(queue, queued_attempts, result.work);
+                tracing::info!(
+                    job_id = %evaluation.job_id,
+                    channel_id = %evaluation.channel_id,
+                    continuations = count,
+                    "claimed delegated-job continuation queued after evaluation release"
+                );
+                return;
+            }
+            Ok(result) => {
+                let retry_visibility = matches!(
+                    result.state,
+                    None | Some(buzz_core::delegated_job::JobState::Requested)
+                );
+                tracing::debug!(
+                    job_id = %evaluation.job_id,
+                    pass,
+                    queried_events = result.queried_events,
+                    attempts = result.attempts,
+                    projected_state = ?result.state,
+                    retry_visibility,
+                    "post-evaluation reconciliation produced no new continuation"
+                );
+                if !retry_visibility {
+                    return;
+                }
+            }
+            Err(error) => tracing::warn!(
+                job_id = %evaluation.job_id,
+                pass,
+                "post-evaluation delegated-job reconciliation failed and remains retryable: {error}"
+            ),
+        }
+        if pass < MAX_VISIBILITY_PASSES {
+            let delay_ms = 50_u64 << (pass - 1);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+    tracing::warn!(
+        job_id = %evaluation.job_id,
+        request_event_id = %evaluation.request_event_id,
+        "accepted job was not promotable within the bounded decision handoff; periodic recovery remains authoritative"
+    );
+}
+
 /// Flush queued work to available agents.
 fn enqueue_job_continuations(
     queue: &mut EventQueue,
@@ -4042,6 +4160,12 @@ fn enqueue_job_continuations(
             },
         });
         queued_attempts.insert(attempt_id);
+        tracing::info!(
+            %attempt_id,
+            %channel_id,
+            queued_attempts = queued_attempts.len(),
+            "durably claimed delegated-job continuation enqueued"
+        );
     }
 }
 
@@ -4058,6 +4182,20 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        if let Some(execution) = batch
+            .events
+            .iter()
+            .find_map(|event| job_execution::from_prompt_tag(&event.prompt_tag))
+        {
+            tracing::info!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                generation = execution.generation,
+                claim_event_id = %execution.claim_event_id,
+                %channel_id,
+                "dispatching claimed delegated-job continuation"
+            );
+        }
         if batch.events.iter().any(|event| {
             job_execution::from_prompt_tag(&event.prompt_tag)
                 .is_some_and(|execution| execution.lease_until <= chrono::Utc::now().timestamp())
@@ -5337,7 +5475,9 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     // so shutdown() runs on all paths (success, error, timeout).
     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
         let init = client.initialize().await?;
-        let session = client.session_new_full(&cwd, vec![], None, None).await?;
+        let session = client
+            .session_new_full(&cwd, vec![], None, None, None)
+            .await?;
         Ok::<_, acp::AcpError>((init, session))
     })
     .await;

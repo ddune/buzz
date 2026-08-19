@@ -2109,6 +2109,34 @@ mod tests {
     }
 
     #[test]
+    fn accepted_evaluation_release_makes_claimed_continuation_dispatchable() {
+        let channel = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(make_job_queued(channel, "evaluate this proposal")));
+        let evaluation = queue.flush_next().expect("evaluation batch");
+        assert!(queue.is_channel_in_flight(channel));
+
+        queue.push_durable_continuation(make_continuation_queued(
+            channel,
+            "accepted generation one",
+            1,
+        ));
+        assert!(
+            queue.flush_next().is_none(),
+            "claim cannot overlap evaluation"
+        );
+
+        queue.mark_complete(evaluation.channel_id);
+        assert!(!queue.is_channel_in_flight(channel));
+        let continuation = queue.flush_next().expect("generation one dispatchable");
+        assert_eq!(continuation.events.len(), 1);
+        let execution = crate::job_execution::from_prompt_tag(&continuation.events[0].prompt_tag)
+            .expect("claimed continuation");
+        assert_eq!(execution.generation, 1);
+        assert!(!execution.claim_event_id.is_empty());
+    }
+
+    #[test]
     fn delegated_job_prompt_requires_structural_accept_or_reject() {
         let channel = Uuid::new_v4();
         let event = make_job_queued(channel, "bounded assignment");

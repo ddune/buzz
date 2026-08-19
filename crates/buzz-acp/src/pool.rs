@@ -1067,6 +1067,7 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
+            channel.job_evaluation.then_some("decision-only"),
         )
         .await?;
 
