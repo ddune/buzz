@@ -164,6 +164,10 @@ pub struct EventQueue {
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
     /// the events were never delivered to the agent).
     withheld_native_steer: HashMap<Uuid, Vec<QueuedEvent>>,
+    /// Supplemental user messages keyed by the accepted job they interrupted.
+    /// Each source event is already durable on the relay; this table carries
+    /// the immutable message into the next locally claimed continuation.
+    job_supplemental_messages: HashMap<Uuid, Vec<crate::job_execution::JobSupplementalMessage>>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -188,6 +192,7 @@ impl EventQueue {
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
+            job_supplemental_messages: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
         }
     }
@@ -254,7 +259,21 @@ impl EventQueue {
     /// Enqueue a durably claimed delegated-job continuation without applying
     /// conversational drop mode or eviction. Once the relay accepts a claim,
     /// local queue pressure must not orphan it until a multi-hour lease expiry.
-    pub fn push_durable_continuation(&mut self, event: QueuedEvent) {
+    pub fn push_durable_continuation(&mut self, mut event: QueuedEvent) {
+        if let Some(execution) = crate::job_execution::from_prompt_tag(&event.prompt_tag) {
+            if let Some(messages) = self.job_supplemental_messages.remove(&execution.job_id) {
+                match crate::job_execution::prompt_tag_with_supplemental_messages(
+                    &execution, messages,
+                ) {
+                    Ok(prompt_tag) => event.prompt_tag = prompt_tag,
+                    Err(error) => tracing::error!(
+                        job_id = %execution.job_id,
+                        attempt_id = %execution.attempt_id,
+                        "failed to bind supplemental context to continuation: {error}"
+                    ),
+                }
+            }
+        }
         let queue = self.queues.entry(event.channel_id).or_default();
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
             tracing::warn!(
@@ -356,17 +375,31 @@ impl EventQueue {
             crate::job_execution::from_prompt_tag(&event.prompt_tag).is_some()
                 || event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST
         });
+        let head_is_job_followup = queue.front().is_some_and(|event| {
+            crate::job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+        });
         // A job proposal or continuation is one obligation boundary. Never
         // combine two jobs, or a proposal and an accepted continuation, into
         // one turn: TaskMeta intentionally carries exactly one attempt.
         let drain_count = if head_is_job {
             1
+        } else if head_is_job_followup {
+            MAX_BATCH_EVENTS.min(
+                queue
+                    .iter()
+                    .take_while(|event| {
+                        crate::job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+                    })
+                    .count(),
+            )
         } else {
             MAX_BATCH_EVENTS.min(
                 queue
                     .iter()
                     .take_while(|event| {
                         crate::job_execution::from_prompt_tag(&event.prompt_tag).is_none()
+                            && crate::job_execution::followup_from_prompt_tag(&event.prompt_tag)
+                                .is_none()
                             && event.event.kind.as_u16() as u32 != buzz_core::kind::KIND_JOB_REQUEST
                     })
                     .count(),
@@ -802,6 +835,96 @@ impl EventQueue {
                 "release_native_steer overflow — dropped newest event to enforce cap"
             );
         }
+    }
+
+    /// Reclassify an ordinary message as a restricted follow-up to an
+    /// interrupted accepted-job generation. The event stays in FIFO position;
+    /// only its session capability class changes. Returns false if the event
+    /// is no longer queued/withheld.
+    pub fn mark_job_followup(
+        &mut self,
+        channel_id: Uuid,
+        event_id: &str,
+        execution: &crate::job_execution::JobExecutionContext,
+    ) -> bool {
+        let context = crate::job_execution::JobFollowupContext {
+            job_id: execution.job_id,
+            request_event_id: execution.request_event_id.clone(),
+            interrupted_attempt_id: execution.attempt_id,
+            interrupted_generation: execution.generation,
+            interrupted_turn_id: execution.turn_id.clone(),
+        };
+        let Ok(prompt_tag) = crate::job_execution::followup_prompt_tag(&context) else {
+            return false;
+        };
+        let mut found_content = None;
+        if let Some(queue) = self.queues.get_mut(&channel_id) {
+            if let Some(event) = queue
+                .iter_mut()
+                .find(|event| event.event.id.to_hex() == event_id)
+            {
+                event.prompt_tag = prompt_tag.clone();
+                found_content = Some(event.event.content.clone());
+            }
+        }
+        if found_content.is_none() {
+            if let Some(events) = self.withheld_native_steer.get_mut(&channel_id) {
+                if let Some(event) = events
+                    .iter_mut()
+                    .find(|event| event.event.id.to_hex() == event_id)
+                {
+                    event.prompt_tag = prompt_tag;
+                    found_content = Some(event.event.content.clone());
+                }
+            }
+        }
+        let Some(content) = found_content else {
+            return false;
+        };
+        let supplemental = self
+            .job_supplemental_messages
+            .entry(execution.job_id)
+            .or_default();
+        if supplemental
+            .iter()
+            .all(|message| message.event_id != event_id)
+        {
+            supplemental.push(crate::job_execution::JobSupplementalMessage {
+                event_id: event_id.to_owned(),
+                content,
+            });
+        }
+        true
+    }
+
+    /// Release queued follow-up restrictions once the accepted obligation has
+    /// a durable terminal lifecycle event. The messages return to ordinary
+    /// conversational classification; no execution continuation remains to
+    /// protect or receive supplemental context.
+    pub fn release_terminal_job_followups(&mut self, job_id: Uuid) -> usize {
+        let mut released = 0;
+        for events in self.queues.values_mut() {
+            for event in events {
+                if crate::job_execution::followup_from_prompt_tag(&event.prompt_tag)
+                    .is_some_and(|context| context.job_id == job_id)
+                {
+                    event.prompt_tag = "accepted-job-followup-released".into();
+                    released += 1;
+                }
+            }
+        }
+        for events in self.withheld_native_steer.values_mut() {
+            for event in events {
+                if crate::job_execution::followup_from_prompt_tag(&event.prompt_tag)
+                    .is_some_and(|context| context.job_id == job_id)
+                {
+                    event.prompt_tag = "accepted-job-followup-released".into();
+                    released += 1;
+                }
+            }
+        }
+        self.job_supplemental_messages.remove(&job_id);
+        released
     }
 
     /// Drop a specific event by id from both the side table and the main
@@ -1643,6 +1766,41 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
                     job.channel_id,
                     job.assignment,
                 ));
+                let supplemental =
+                    crate::job_execution::supplemental_messages_from_prompt_tag(&event.prompt_tag);
+                if !supplemental.is_empty() {
+                    orientation.push_str(
+                        "\n\n[Supplemental context from the interrupted generation]\nThese messages were handled by a separate read-only conversational turn. Incorporate their context into the remaining tracked work without repeating the status response or treating them as a new job.",
+                    );
+                    for message in supplemental {
+                        orientation.push_str(&format!(
+                            "\n\nEvent {}:\n{}",
+                            message.event_id, message.content
+                        ));
+                    }
+                }
+            }
+        }
+        sections.push(orientation);
+    } else if batch
+        .events
+        .iter()
+        .all(|event| crate::job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some())
+    {
+        let mut orientation = String::from(
+            "[Accepted job follow-up — read-only]\nAn accepted delegated job owns this workspace. Answer the user's supplemental conversational question briefly, but do not continue implementation, mutate files or Git state, run commands or processes, or issue complete/blocked/delegated lifecycle operations. If the user explicitly asks to test this fence, you may make one mutation-tool call solely to observe its structural denial; do not retry it or carry that requested mutation into tracked execution. Durable reconciliation will dispatch the sole mutation-capable claimed continuation after this response ends.",
+        );
+        for event in &batch.events {
+            if let Some(followup) =
+                crate::job_execution::followup_from_prompt_tag(&event.prompt_tag)
+            {
+                orientation.push_str(&format!(
+                    "\n\nJob/obligation: {}\nInterrupted attempt: {}\nInterrupted generation: {}\nInterrupted turn: {}",
+                    followup.job_id,
+                    followup.interrupted_attempt_id,
+                    followup.interrupted_generation,
+                    followup.interrupted_turn_id,
+                ));
             }
         }
         sections.push(orientation);
@@ -2015,6 +2173,133 @@ mod tests {
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].event.kind, Kind::Custom(9));
         assert!(crate::job_execution::from_prompt_tag(&second.events[0].prompt_tag).is_none());
+    }
+
+    #[test]
+    fn interrupted_job_followup_is_readonly_and_precedes_the_only_next_generation() {
+        let channel = Uuid::new_v4();
+        let mut generation_one = make_job_queued(channel, "immutable assignment root");
+        let request =
+            buzz_core::delegated_job::parse_job_request(&generation_one.event).expect("request");
+        let execution_one = crate::job_execution::JobExecutionContext {
+            job_id: request.job_id,
+            request_event_id: request.request_event_id.clone(),
+            attempt_id: Uuid::new_v4(),
+            generation: 1,
+            runnable_event_id: "ab".repeat(32),
+            claim_event_id: "cd".repeat(32),
+            turn_id: "turn-1".into(),
+            lease_until: i64::MAX,
+        };
+        generation_one.prompt_tag =
+            crate::job_execution::prompt_tag(&execution_one).expect("prompt tag");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push_durable_continuation(generation_one.clone());
+        let dispatched_one = queue.flush_next().expect("generation 1");
+        assert_eq!(
+            crate::job_execution::from_prompt_tag(&dispatched_one.events[0].prompt_tag)
+                .map(|context| context.generation),
+            Some(1)
+        );
+
+        let followup = make_queued(channel, "Give me a brief status update.");
+        let followup_id = followup.event.id.to_hex();
+        assert!(queue.push(followup));
+        assert!(queue.mark_job_followup(channel, &followup_id, &execution_one));
+
+        let execution_two = crate::job_execution::JobExecutionContext {
+            attempt_id: Uuid::new_v4(),
+            generation: 2,
+            runnable_event_id: "ef".repeat(32),
+            claim_event_id: "01".repeat(32),
+            turn_id: "turn-2".into(),
+            ..execution_one.clone()
+        };
+        let mut generation_two = generation_one;
+        generation_two.prompt_tag =
+            crate::job_execution::prompt_tag(&execution_two).expect("prompt tag");
+        queue.push_durable_continuation(generation_two);
+
+        queue.mark_complete(channel);
+        let restricted = queue.flush_next().expect("restricted follow-up");
+        assert!(restricted.events.iter().all(|event| {
+            crate::job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+        }));
+        assert!(crate::job_execution::from_prompt_tag(&restricted.events[0].prompt_tag).is_none());
+        let rendered = format_prompt(&restricted, &FormatPromptArgs::default()).join("\n");
+        assert!(rendered.contains("[Accepted job follow-up — read-only]"));
+        assert!(rendered.contains("do not continue implementation"));
+
+        queue.mark_complete(channel);
+        let resumed = queue.flush_next().expect("generation 2");
+        let resumed_execution =
+            crate::job_execution::from_prompt_tag(&resumed.events[0].prompt_tag)
+                .expect("execution authority");
+        assert_eq!(resumed_execution.job_id, execution_one.job_id);
+        assert_eq!(resumed_execution.generation, 2);
+        let supplemental = crate::job_execution::supplemental_messages_from_prompt_tag(
+            &resumed.events[0].prompt_tag,
+        );
+        assert_eq!(supplemental.len(), 1);
+        assert_eq!(supplemental[0].event_id, followup_id);
+        assert_eq!(supplemental[0].content, "Give me a brief status update.");
+        let rendered = format_prompt(&resumed, &FormatPromptArgs::default()).join("\n");
+        assert!(rendered.contains("[Supplemental context from the interrupted generation]"));
+        assert!(rendered.contains("Give me a brief status update."));
+
+        queue.mark_complete(channel);
+        assert!(queue.flush_next().is_none(), "no duplicate generation 2");
+    }
+
+    #[test]
+    fn followup_restriction_is_channel_scoped_and_ordinary_conversation_stays_ordinary() {
+        let job_channel = Uuid::new_v4();
+        let other_channel = Uuid::new_v4();
+        let generation = make_continuation_queued(job_channel, "job", 1);
+        let execution =
+            crate::job_execution::from_prompt_tag(&generation.prompt_tag).expect("execution");
+        let followup = make_queued(job_channel, "status?");
+        let followup_id = followup.event.id.to_hex();
+        let ordinary = make_queued(other_channel, "ordinary conversation");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(followup));
+        assert!(queue.push(ordinary));
+        assert!(queue.mark_job_followup(job_channel, &followup_id, &execution));
+
+        let first = queue.flush_next().expect("oldest follow-up");
+        assert!(
+            crate::job_execution::followup_from_prompt_tag(&first.events[0].prompt_tag).is_some()
+        );
+        queue.mark_complete(job_channel);
+
+        let second = queue.flush_next().expect("other channel conversation");
+        assert_eq!(second.channel_id, other_channel);
+        assert!(
+            crate::job_execution::followup_from_prompt_tag(&second.events[0].prompt_tag).is_none()
+        );
+        assert!(crate::job_execution::from_prompt_tag(&second.events[0].prompt_tag).is_none());
+    }
+
+    #[test]
+    fn terminal_job_releases_queued_followup_restriction() {
+        let channel = Uuid::new_v4();
+        let generation = make_continuation_queued(channel, "job", 1);
+        let execution =
+            crate::job_execution::from_prompt_tag(&generation.prompt_tag).expect("execution");
+        let followup = make_queued(channel, "status?");
+        let followup_id = followup.event.id.to_hex();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(followup));
+        assert!(queue.mark_job_followup(channel, &followup_id, &execution));
+
+        assert_eq!(queue.release_terminal_job_followups(execution.job_id), 1);
+        let batch = queue.flush_next().expect("released conversation");
+        assert!(
+            crate::job_execution::followup_from_prompt_tag(&batch.events[0].prompt_tag).is_none()
+        );
+        assert_eq!(batch.events[0].prompt_tag, "accepted-job-followup-released");
     }
 
     #[test]

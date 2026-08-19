@@ -46,6 +46,11 @@ impl DevMcp {
         Parameters(p): Parameters<shell::ShellParams>,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if job_followup_readonly() && !followup_shell_command_allowed(&p.command) {
+            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
+                "Shell and process execution are disabled while an accepted job owns the workspace; the durable claimed continuation is the sole mutation-capable authority.",
+            )]));
+        }
         if evaluation_only() && !evaluation_shell_command_allowed(&p.command) {
             return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
                 "Delegated-job evaluation permits only `buzz jobs accept` or `buzz jobs reject`; executable repository work begins in the claimed continuation.",
@@ -84,9 +89,9 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<str_replace::StrReplaceParams>,
     ) -> Result<String, ErrorData> {
-        if evaluation_only() {
+        if !file_mutation_allowed(evaluation_only(), job_followup_readonly()) {
             return Err(ErrorData::invalid_request(
-                "file mutation is disabled during delegated-job evaluation",
+                "file mutation is disabled in this restricted delegated-job session",
                 None,
             ));
         }
@@ -136,6 +141,18 @@ impl DevMcp {
 
 fn evaluation_only() -> bool {
     std::env::var_os("BUZZ_JOB_EVALUATION_ONLY").is_some()
+}
+
+fn job_followup_readonly() -> bool {
+    std::env::var_os("BUZZ_JOB_FOLLOWUP_READONLY").is_some()
+}
+
+fn followup_shell_command_allowed(_command: &str) -> bool {
+    false
+}
+
+fn file_mutation_allowed(evaluation: bool, followup_readonly: bool) -> bool {
+    !evaluation && !followup_readonly
 }
 
 fn evaluation_shell_command_allowed(command: &str) -> bool {
@@ -242,7 +259,9 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
 
 #[cfg(test)]
 mod evaluation_tests {
-    use super::evaluation_shell_command_allowed;
+    use super::{
+        evaluation_shell_command_allowed, file_mutation_allowed, followup_shell_command_allowed,
+    };
 
     #[test]
     fn evaluation_shell_allows_only_constrained_job_decisions() {
@@ -269,5 +288,26 @@ mod evaluation_tests {
                 "unexpected evaluation command admission: {command}"
             );
         }
+    }
+
+    #[test]
+    fn accepted_job_followup_denies_every_shell_mutation_path() {
+        // The follow-up handler rejects shell before parsing the command. Pin
+        // representative file, Git, process, lifecycle, and MCP escape paths.
+        for command in [
+            "touch marker-b",
+            "git add .",
+            "git commit -m continued",
+            "cargo test",
+            "python -c 'open(\"marker-b\", \"w\").close()'",
+            "buzz jobs complete --job id",
+            "buzz jobs blocked --job id",
+            "buzz jobs delegate --job id",
+        ] {
+            assert!(!followup_shell_command_allowed(command));
+        }
+        assert!(!file_mutation_allowed(false, true));
+        assert!(!file_mutation_allowed(true, false));
+        assert!(file_mutation_allowed(false, false));
     }
 }

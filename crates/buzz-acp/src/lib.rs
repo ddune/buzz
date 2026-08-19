@@ -2787,6 +2787,37 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            // A durable terminal disposition releases any
+                            // queued read-only follow-up classification for
+                            // this job. Until this exact lifecycle event, the
+                            // accepted obligation continues to own mutation
+                            // authority even if its runtime turn ended.
+                            if matches!(
+                                kind_u32,
+                                KIND_JOB_REJECTED
+                                    | KIND_JOB_COMPLETED
+                                    | KIND_JOB_BLOCKED
+                                    | KIND_JOB_DELEGATED
+                            ) {
+                                if let Ok(lifecycle) =
+                                    buzz_core::delegated_job::parse_job_lifecycle(
+                                        &buzz_event.event,
+                                    )
+                                {
+                                    if lifecycle.author == pubkey_hex
+                                        && lifecycle.channel_id == buzz_event.channel_id
+                                    {
+                                        let released = queue
+                                            .release_terminal_job_followups(lifecycle.job_id);
+                                        tracing::info!(
+                                            job_id = %lifecycle.job_id,
+                                            released,
+                                            "terminal delegated-job event released queued follow-up restrictions"
+                                        );
+                                    }
+                                }
+                            }
+
                             // Accept/reject is a structural boundary for a
                             // delegated-job evaluation turn. Observe our own
                             // lifecycle events before the generic ignore-self
@@ -3149,8 +3180,33 @@ async fn tokio_main() -> Result<()> {
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
-                                        );
+                                    );
                                     if !native_attempted {
+                                        if matches!(
+                                            signal,
+                                            ControlSignal::Steer | ControlSignal::Interrupt
+                                        ) {
+                                            if let Some(execution) =
+                                                active_job_execution_for_channel(
+                                                    &pool,
+                                                    buzz_event.channel_id,
+                                                )
+                                            {
+                                                let classified = queue.mark_job_followup(
+                                                    buzz_event.channel_id,
+                                                    &event_id_hex,
+                                                    &execution,
+                                                );
+                                                tracing::info!(
+                                                    job_id = %execution.job_id,
+                                                    generation = execution.generation,
+                                                    channel = %buzz_event.channel_id,
+                                                    event_id = %event_id_hex,
+                                                    classified,
+                                                    "classified cancel-and-merge replacement as accepted-job read-only follow-up"
+                                                );
+                                            }
+                                        }
                                         signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -3636,6 +3692,17 @@ async fn tokio_main() -> Result<()> {
                     queue.release_native_steer(channel_id, &event_id);
                 }
                 if signal_fallback {
+                    if let Some(execution) = active_job_execution_for_channel(&pool, channel_id) {
+                        let classified = queue.mark_job_followup(channel_id, &event_id, &execution);
+                        tracing::info!(
+                            job_id = %execution.job_id,
+                            generation = execution.generation,
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            classified,
+                            "classified failed-steer replacement as accepted-job read-only follow-up"
+                        );
+                    }
                     // Universal cancel+merge fallback. Note: the
                     // queued event has already been released to the
                     // front of `queues[channel_id]`, so the cancel
@@ -3983,6 +4050,18 @@ fn signal_in_flight_task(
     false
 }
 
+/// Return the durable execution authority currently bound to a channel turn.
+/// A generic conversation task deliberately returns `None`.
+fn active_job_execution_for_channel(
+    pool: &AgentPool,
+    channel_id: uuid::Uuid,
+) -> Option<job_execution::JobExecutionContext> {
+    pool.task_map()
+        .values()
+        .find(|meta| meta.channel_id == Some(channel_id))
+        .and_then(|meta| meta.job_execution.clone())
+}
+
 /// Stop exactly the proposal turn that produced a durable accept/reject event.
 /// Ordinary work in the same channel is deliberately unaffected.
 fn signal_job_evaluation_boundary(
@@ -4262,6 +4341,18 @@ fn dispatch_pending(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
+        let authority_transition = batch.events.iter().any(|event| {
+            job_execution::from_prompt_tag(&event.prompt_tag).is_some()
+                || job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+        });
+        if authority_transition {
+            let invalidated = pool.invalidate_channel_sessions(channel_id);
+            tracing::info!(
+                %channel_id,
+                invalidated,
+                "invalidated stale channel sessions before delegated-job authority transition"
+            );
+        }
         let affinity_hit = pool.has_session_for(channel_id);
         let mut agent = match pool.try_claim(Some(channel_id)) {
             Some(a) => a,
@@ -5882,6 +5973,52 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+
+    #[tokio::test]
+    async fn active_job_execution_lookup_never_grants_authority_to_generic_conversation() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let job_channel = Uuid::new_v4();
+        let generic_channel = Uuid::new_v4();
+        let execution = job_execution::JobExecutionContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "ab".repeat(32),
+            attempt_id: Uuid::new_v4(),
+            generation: 1,
+            runnable_event_id: "cd".repeat(32),
+            claim_event_id: "ef".repeat(32),
+            turn_id: "job-turn".into(),
+            lease_until: i64::MAX,
+        };
+        for (channel_id, job_execution) in [
+            (job_channel, Some(execution.clone())),
+            (generic_channel, None),
+        ] {
+            let abort_handle = pool.join_set.spawn(async {});
+            pool.task_map_mut().insert(
+                abort_handle.id(),
+                pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(channel_id),
+                    turn_id: format!("turn-{channel_id}"),
+                    job_execution,
+                    job_evaluation: None,
+                    job_evaluation_decided: false,
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            active_job_execution_for_channel(&pool, job_channel)
+                .map(|context| (context.job_id, context.generation)),
+            Some((execution.job_id, 1))
+        );
+        assert!(active_job_execution_for_channel(&pool, generic_channel).is_none());
+        assert!(active_job_execution_for_channel(&pool, Uuid::new_v4()).is_none());
     }
 
     #[tokio::test]

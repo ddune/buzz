@@ -34,6 +34,31 @@ pub struct JobExecutionContext {
     pub lease_until: i64,
 }
 
+/// Durable user context that arrived while a tracked generation was active.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct JobSupplementalMessage {
+    pub event_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JobContinuationPromptEnvelope {
+    execution: JobExecutionContext,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supplemental_messages: Vec<JobSupplementalMessage>,
+}
+
+/// Runtime classification for the restricted conversational response that
+/// may run between an interrupted generation and its durable continuation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct JobFollowupContext {
+    pub job_id: Uuid,
+    pub request_event_id: String,
+    pub interrupted_attempt_id: Uuid,
+    pub interrupted_generation: i64,
+    pub interrupted_turn_id: String,
+}
+
 /// Identity of a proposed delegated job whose accept/reject decision is being
 /// made by an ordinary ACP turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +78,7 @@ pub fn evaluation_context(event: &Event) -> Option<JobEvaluationContext> {
 }
 
 const PROMPT_TAG_PREFIX: &str = "delegated-job-continuation:";
+const FOLLOWUP_PROMPT_TAG_PREFIX: &str = "delegated-job-followup-readonly:";
 
 /// Encode attempt metadata into the harness-internal queue tag.
 pub fn prompt_tag(execution: &JobExecutionContext) -> Result<String, serde_json::Error> {
@@ -64,7 +90,50 @@ pub fn prompt_tag(execution: &JobExecutionContext) -> Result<String, serde_json:
 
 /// Decode attempt metadata from the harness-internal queue tag.
 pub fn from_prompt_tag(value: &str) -> Option<JobExecutionContext> {
-    serde_json::from_str(value.strip_prefix(PROMPT_TAG_PREFIX)?).ok()
+    let payload = value.strip_prefix(PROMPT_TAG_PREFIX)?;
+    serde_json::from_str(payload).ok().or_else(|| {
+        serde_json::from_str::<JobContinuationPromptEnvelope>(payload)
+            .ok()
+            .map(|envelope| envelope.execution)
+    })
+}
+
+/// Bind already-durable supplemental messages to the claimed continuation's
+/// harness prompt metadata.
+pub fn prompt_tag_with_supplemental_messages(
+    execution: &JobExecutionContext,
+    supplemental_messages: Vec<JobSupplementalMessage>,
+) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "{PROMPT_TAG_PREFIX}{}",
+        serde_json::to_string(&JobContinuationPromptEnvelope {
+            execution: execution.clone(),
+            supplemental_messages,
+        })?
+    ))
+}
+
+/// Recover supplemental context bound to a claimed continuation.
+pub fn supplemental_messages_from_prompt_tag(value: &str) -> Vec<JobSupplementalMessage> {
+    value
+        .strip_prefix(PROMPT_TAG_PREFIX)
+        .and_then(|payload| serde_json::from_str::<JobContinuationPromptEnvelope>(payload).ok())
+        .map(|envelope| envelope.supplemental_messages)
+        .unwrap_or_default()
+}
+
+/// Encode a supplemental conversational turn that must not inherit job
+/// execution authority.
+pub fn followup_prompt_tag(context: &JobFollowupContext) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "{FOLLOWUP_PROMPT_TAG_PREFIX}{}",
+        serde_json::to_string(context)?
+    ))
+}
+
+/// Decode a restricted accepted-job follow-up queue tag.
+pub fn followup_from_prompt_tag(value: &str) -> Option<JobFollowupContext> {
+    serde_json::from_str(value.strip_prefix(FOLLOWUP_PROMPT_TAG_PREFIX)?).ok()
 }
 
 /// One recovered continuation ready for normal ACP dispatch.
@@ -618,6 +687,57 @@ mod tests {
                 channel_id,
             })
         );
+    }
+
+    #[test]
+    fn continuation_prompt_preserves_execution_identity_and_supplemental_context() {
+        let execution = JobExecutionContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "ab".repeat(32),
+            attempt_id: Uuid::new_v4(),
+            generation: 2,
+            runnable_event_id: "cd".repeat(32),
+            claim_event_id: "ef".repeat(32),
+            turn_id: "turn-2".into(),
+            lease_until: i64::MAX,
+        };
+        let supplemental = vec![JobSupplementalMessage {
+            event_id: "01".repeat(32),
+            content: "What remains?".into(),
+        }];
+        let encoded = prompt_tag_with_supplemental_messages(&execution, supplemental.clone())
+            .expect("prompt tag");
+
+        let decoded = from_prompt_tag(&encoded).expect("execution");
+        assert_eq!(decoded.job_id, execution.job_id);
+        assert_eq!(decoded.attempt_id, execution.attempt_id);
+        assert_eq!(decoded.generation, 2);
+        assert_eq!(
+            supplemental_messages_from_prompt_tag(&encoded),
+            supplemental
+        );
+
+        let legacy = prompt_tag(&execution).expect("legacy prompt tag");
+        assert_eq!(
+            from_prompt_tag(&legacy).map(|context| context.attempt_id),
+            Some(execution.attempt_id)
+        );
+        assert!(supplemental_messages_from_prompt_tag(&legacy).is_empty());
+    }
+
+    #[test]
+    fn followup_prompt_tag_cannot_be_mistaken_for_execution_authority() {
+        let followup = JobFollowupContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "ab".repeat(32),
+            interrupted_attempt_id: Uuid::new_v4(),
+            interrupted_generation: 1,
+            interrupted_turn_id: "turn-1".into(),
+        };
+        let encoded = followup_prompt_tag(&followup).expect("follow-up tag");
+
+        assert_eq!(followup_from_prompt_tag(&encoded), Some(followup));
+        assert!(from_prompt_tag(&encoded).is_none());
     }
 
     #[test]

@@ -1013,7 +1013,31 @@ struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
     id: Option<Uuid>,
     channel_type: Option<&'a str>,
-    job_evaluation: bool,
+    capability_profile: SessionCapabilityProfile,
+}
+
+/// Capability authority selected structurally from the queued batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCapabilityProfile {
+    Ordinary,
+    JobDecision,
+    JobFollowupReadonly,
+    JobExecution,
+}
+
+impl SessionCapabilityProfile {
+    fn strips_native_tools(self) -> bool {
+        matches!(self, Self::JobDecision | Self::JobFollowupReadonly)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::JobDecision => "job-decision",
+            Self::JobFollowupReadonly => "job-followup-readonly",
+            Self::JobExecution => "job-execution",
+        }
+    }
 }
 
 async fn create_session_and_apply_model(
@@ -1052,7 +1076,7 @@ async fn create_session_and_apply_model(
         channel.id,
         channel.channel_type,
         ctx.session_title.as_deref(),
-        channel.job_evaluation,
+        channel.capability_profile,
     );
 
     let resp = agent
@@ -1067,7 +1091,10 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
-            channel.job_evaluation.then_some("decision-only"),
+            channel
+                .capability_profile
+                .strips_native_tools()
+                .then_some("decision-only"),
         )
         .await?;
 
@@ -1283,22 +1310,26 @@ fn mcp_servers_with_git_origin(
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
     agent_name: Option<&str>,
-    job_evaluation: bool,
+    capability_profile: SessionCapabilityProfile,
 ) -> Vec<McpServer> {
     let mut servers = servers.to_vec();
-    if job_evaluation {
+    if capability_profile.strips_native_tools() {
         // Unknown MCP servers may expose mutations and cannot be trusted to
-        // honor Buzz's evaluation-only environment. Keep only the bundled
-        // server whose handlers enforce the restricted tool boundary.
+        // honor Buzz's restricted-session environment. Keep only the bundled
+        // server whose handlers enforce the selected tool boundary.
         servers.retain(|server| server.command == "buzz-dev-mcp");
         // Hermes registers ACP-provided MCP processes globally by server name
         // and intentionally treats a repeated name as an idempotent lookup.
-        // Give the fail-closed evaluation process its own registry identity so
-        // a later execution session cannot reuse its evaluation-only
-        // environment. The executable identity remains exact and trusted; only
-        // the ACP registration name is separated from normal execution.
+        // Give each fail-closed restricted process its own registry identity so
+        // a later execution session cannot reuse its environment. The
+        // executable identity remains exact and trusted; only the ACP
+        // registration name is separated from normal execution.
         for server in &mut servers {
-            server.name = "buzz-dev-mcp-job-decision".into();
+            server.name = match capability_profile {
+                SessionCapabilityProfile::JobDecision => "buzz-dev-mcp-job-decision".into(),
+                SessionCapabilityProfile::JobFollowupReadonly => "buzz-dev-mcp-job-followup".into(),
+                _ => server.name.clone(),
+            };
         }
     }
     let origin = match (channel_id, channel_type) {
@@ -1326,17 +1357,26 @@ fn mcp_servers_with_git_origin(
     // continuing as an untracked execution attempt.
     for server in &mut servers {
         server.env.retain(|entry| {
-            entry.name != "BUZZ_ACP_JOB_DECISION_YIELD" && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
+            entry.name != "BUZZ_ACP_JOB_DECISION_YIELD"
+                && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
+                && entry.name != "BUZZ_JOB_FOLLOWUP_READONLY"
         });
-        if job_evaluation {
-            server.env.push(EnvVar {
-                name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
+        match capability_profile {
+            SessionCapabilityProfile::JobDecision => {
+                server.env.push(EnvVar {
+                    name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
+                    value: "1".into(),
+                });
+                server.env.push(EnvVar {
+                    name: "BUZZ_JOB_EVALUATION_ONLY".into(),
+                    value: "1".into(),
+                });
+            }
+            SessionCapabilityProfile::JobFollowupReadonly => server.env.push(EnvVar {
+                name: "BUZZ_JOB_FOLLOWUP_READONLY".into(),
                 value: "1".into(),
-            });
-            server.env.push(EnvVar {
-                name: "BUZZ_JOB_EVALUATION_ONLY".into(),
-                value: "1".into(),
-            });
+            }),
+            SessionCapabilityProfile::Ordinary | SessionCapabilityProfile::JobExecution => {}
         }
     }
     servers
@@ -1830,6 +1870,28 @@ pub async fn run_prompt_task(
                 && crate::job_execution::from_prompt_tag(&event.prompt_tag).is_none()
         })
     });
+    let job_followup_readonly = batch.as_ref().is_some_and(|batch| {
+        !batch.events.is_empty()
+            && batch.events.iter().all(|event| {
+                crate::job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+            })
+    });
+    let job_execution = batch.as_ref().is_some_and(|batch| {
+        !batch.events.is_empty()
+            && batch
+                .events
+                .iter()
+                .all(|event| crate::job_execution::from_prompt_tag(&event.prompt_tag).is_some())
+    });
+    let capability_profile = if job_evaluation {
+        SessionCapabilityProfile::JobDecision
+    } else if job_followup_readonly {
+        SessionCapabilityProfile::JobFollowupReadonly
+    } else if job_execution {
+        SessionCapabilityProfile::JobExecution
+    } else {
+        SessionCapabilityProfile::Ordinary
+    };
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.channel_id),
@@ -1839,10 +1901,10 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
-    if job_evaluation {
-        // Evaluation must never inherit an unrestricted MCP session. A fresh
-        // session receives an evaluation-only tool environment; the decision
-        // boundary rotates it away before claimed execution is dispatched.
+    if !matches!(capability_profile, SessionCapabilityProfile::Ordinary) {
+        // Every authority transition gets a fresh session. Restricted turns
+        // must never inherit an unrestricted session, and a claimed execution
+        // must never reuse the stripped follow-up/decision surface.
         agent.state.invalidate(&source);
     }
     let turn_started_at = chrono::Utc::now().to_rfc3339();
@@ -2057,7 +2119,7 @@ pub async fn run_prompt_task(
                         name: title_channel.as_deref(),
                         id: Some(*cid),
                         channel_type: origin_channel_type.as_deref(),
-                        job_evaluation,
+                        capability_profile,
                     },
                 )
                 .await
@@ -2123,7 +2185,7 @@ pub async fn run_prompt_task(
                         name: None,
                         id: None,
                         channel_type: None,
-                        job_evaluation: false,
+                        capability_profile: SessionCapabilityProfile::Ordinary,
                     },
                 )
                 .await
@@ -2180,6 +2242,7 @@ pub async fn run_prompt_task(
         serde_json::json!({
             "sessionId": session_id,
             "isNewSession": is_new_session,
+            "capabilityProfile": capability_profile.as_str(),
         }),
     );
 
@@ -4814,7 +4877,7 @@ mod tests {
             Some(channel_id),
             Some("stream"),
             None,
-            false,
+            SessionCapabilityProfile::Ordinary,
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
@@ -4836,7 +4899,7 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("dm"),
             Some("Builder"),
-            false,
+            SessionCapabilityProfile::Ordinary,
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
@@ -4864,7 +4927,7 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
-            true,
+            SessionCapabilityProfile::JobDecision,
         );
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].command, "buzz-dev-mcp");
@@ -4884,14 +4947,14 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
-            true,
+            SessionCapabilityProfile::JobDecision,
         );
         let execution = mcp_servers_with_git_origin(
             &[test_mcp_server()],
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
-            false,
+            SessionCapabilityProfile::JobExecution,
         );
 
         assert_eq!(evaluation[0].command, execution[0].command);
@@ -4900,6 +4963,30 @@ mod tests {
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(evaluation[0].env.iter().any(|entry| entry.name == name));
             assert!(!execution[0].env.iter().any(|entry| entry.name == name));
+        }
+    }
+
+    #[test]
+    fn job_followup_keeps_only_readonly_bundled_mcp() {
+        let mut unknown = test_mcp_server();
+        unknown.name = "external".into();
+        unknown.command = "external-mcp".into();
+        let servers = mcp_servers_with_git_origin(
+            &[test_mcp_server(), unknown],
+            Some(Uuid::new_v4()),
+            Some("stream"),
+            None,
+            SessionCapabilityProfile::JobFollowupReadonly,
+        );
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "buzz-dev-mcp-job-followup");
+        assert!(servers[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_READONLY" && entry.value == "1"));
+        for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
+            assert!(!servers[0].env.iter().any(|entry| entry.name == name));
         }
     }
 
@@ -8713,7 +8800,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -8752,7 +8839,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -8788,7 +8875,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -8823,7 +8910,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -8865,7 +8952,7 @@ exit 0"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -8994,7 +9081,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9067,7 +9154,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9124,7 +9211,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9168,7 +9255,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9211,7 +9298,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9279,7 +9366,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9318,7 +9405,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9393,7 +9480,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
@@ -9436,7 +9523,7 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
             },
         )
         .await
