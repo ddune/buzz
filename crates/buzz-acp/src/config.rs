@@ -1380,6 +1380,10 @@ pub fn resolve_channel_filters(
                 }
             }
         }
+        // Lifecycle decision events deliberately forbid `p`, so a relay-side
+        // mention filter would make the structural turn boundary invisible.
+        // Conversational mention policy is still enforced locally by rules.
+        filter.require_mention = false;
     }
 
     result
@@ -1411,7 +1415,7 @@ pub fn resolve_dynamic_channel_filter(
             if !allowed {
                 return Some(ChannelFilter {
                     kinds: Some(vec![KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED]),
-                    require_mention: true,
+                    require_mention: false,
                 });
             }
         }
@@ -1434,7 +1438,9 @@ pub fn resolve_dynamic_channel_filter(
             }
             Some(ChannelFilter {
                 kinds: Some(kinds),
-                require_mention: !config.no_mention_filter,
+                // Decision events forbid `p`; conversational mentions remain
+                // locally filtered by match_event.
+                require_mention: false,
             })
         }
         SubscribeMode::All => {
@@ -1456,7 +1462,6 @@ pub fn resolve_dynamic_channel_filter(
             // evaluate ALL rules against this specific channel (including
             // channel-specific rules, not just ChannelScope::All).
             let mut merged_kinds: Option<Vec<u32>> = Some(vec![]);
-            let mut require_mention = true;
             let mut has_rule = false;
 
             for rule in rules {
@@ -1473,15 +1478,12 @@ pub fn resolve_dynamic_channel_filter(
                         }
                     }
                 }
-                if !rule.require_mention {
-                    require_mention = false;
-                }
             }
 
             if !has_rule {
                 return Some(ChannelFilter {
                     kinds: Some(vec![KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED]),
-                    require_mention: true,
+                    require_mention: false,
                 });
             }
 
@@ -1494,7 +1496,9 @@ pub fn resolve_dynamic_channel_filter(
             }
             Some(ChannelFilter {
                 kinds: merged_kinds,
-                require_mention,
+                // The combined relay subscription must admit decision events,
+                // which cannot carry `p`. Rules retain the local policy.
+                require_mention: false,
             })
         }
     }
@@ -1595,7 +1599,10 @@ mod tests {
         assert_eq!(result.len(), 2);
         for ch in &channels {
             let f = result.get(ch).expect("channel should be present");
-            assert!(f.require_mention, "mentions mode requires mention");
+            assert!(
+                !f.require_mention,
+                "relay subscription must admit decision events without p tags"
+            );
             let kinds = f.kinds.as_ref().expect("should have kinds");
             assert!(kinds.contains(&buzz_core::kind::KIND_STREAM_MESSAGE));
             assert!(kinds.contains(&buzz_core::kind::KIND_JOB_REQUEST));
@@ -2039,7 +2046,7 @@ mod tests {
                 ][..]
             )
         );
-        assert!(filter.require_mention);
+        assert!(!filter.require_mention);
     }
 
     #[test]

@@ -4239,6 +4239,11 @@ fn handle_prompt_result(
         .values()
         .find(|meta| meta.agent_index == agent_index)
         .and_then(|meta| meta.job_execution.clone());
+    let job_evaluation = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .and_then(|meta| meta.job_evaluation.clone());
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -4277,12 +4282,18 @@ fn handle_prompt_result(
             .events
             .iter()
             .any(|event| job_execution::from_prompt_tag(&event.prompt_tag).is_some());
+        let is_job_evaluation = job_evaluation.is_some();
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if is_job_attempt {
             tracing::info!(
                 channel_id = %batch.channel_id,
                 "job attempt ended; durable reconciliation owns continuation"
+            );
+        } else if should_drop_decided_job_evaluation(is_job_evaluation) {
+            tracing::info!(
+                channel_id = %batch.channel_id,
+                "job evaluation ended at its durable decision boundary; dropping proposal batch"
             );
         } else if !removed_channels.contains(&batch.channel_id) {
             if matches!(
@@ -4634,6 +4645,13 @@ fn handle_prompt_result(
         }
     }
     LoopAction::Continue
+}
+
+/// A proposal turn carrying durable evaluation metadata is consumed by its
+/// accept/reject decision. It must never enter ordinary cancel-and-merge
+/// requeue handling.
+fn should_drop_decided_job_evaluation(has_evaluation_context: bool) -> bool {
+    has_evaluation_context
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5674,6 +5692,12 @@ mod owner_control_command_tests {
         assert!(signal_job_evaluation_boundary(&mut pool, &evaluation));
         assert_eq!(control_rx.await.unwrap(), ControlSignal::Cancel);
         assert!(!signal_job_evaluation_boundary(&mut pool, &evaluation));
+    }
+
+    #[test]
+    fn decided_job_evaluation_is_dropped_instead_of_requeued() {
+        assert!(should_drop_decided_job_evaluation(true));
+        assert!(!should_drop_decided_job_evaluation(false));
     }
 
     #[test]
