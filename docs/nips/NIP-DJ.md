@@ -23,6 +23,8 @@ An accepted delegated job is the structural input from which BTOM may create a d
 
 All events are regular append-only stored events. The relay materializes the current state transactionally for deterministic queries and restart recovery; lifecycle history remains in the signed event log.
 
+Generic NIP-09 deletion events MUST NOT delete delegated-job events. Revocation or disposition is represented only by the explicit lifecycle transitions below, preserving immutable history and restart recovery.
+
 ## Job request (`43001`)
 
 Required public tags, each exactly once and with exactly two elements:
