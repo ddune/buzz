@@ -1289,12 +1289,7 @@ fn mcp_servers_with_git_origin(
         // Unknown MCP servers may expose mutations and cannot be trusted to
         // honor Buzz's evaluation-only environment. Keep only the bundled
         // server whose handlers enforce the restricted tool boundary.
-        servers.retain(|server| {
-            std::path::Path::new(&server.command)
-                .file_stem()
-                .and_then(|name| name.to_str())
-                == Some("buzz-dev-mcp")
-        });
+        servers.retain(|server| server.command == "buzz-dev-mcp");
     }
     let origin = match (channel_id, channel_type) {
         (Some(channel_id), Some("stream")) => Some(EnvVar {
@@ -4851,8 +4846,11 @@ mod tests {
         let mut unknown = test_mcp_server();
         unknown.name = "external".into();
         unknown.command = "external-mcp".into();
+        let mut same_basename = test_mcp_server();
+        same_basename.name = "lookalike".into();
+        same_basename.command = "/tmp/buzz-dev-mcp".into();
         let servers = mcp_servers_with_git_origin(
-            &[test_mcp_server(), unknown],
+            &[test_mcp_server(), unknown, same_basename],
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
