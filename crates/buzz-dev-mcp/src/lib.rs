@@ -147,8 +147,39 @@ fn job_followup_readonly() -> bool {
     std::env::var_os("BUZZ_JOB_FOLLOWUP_READONLY").is_some()
 }
 
-fn followup_shell_command_allowed(_command: &str) -> bool {
-    false
+fn followup_shell_command_allowed(command: &str) -> bool {
+    let Ok(expected_channel) = std::env::var("BUZZ_JOB_FOLLOWUP_CHANNEL_ID") else {
+        return false;
+    };
+    followup_shell_command_allowed_for(command, &expected_channel)
+}
+
+fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> bool {
+    if command
+        .chars()
+        .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r'))
+    {
+        return false;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    if words.get(..3) != Some(&["buzz", "messages", "send"][..]) {
+        return false;
+    }
+    let value_after = |flag: &str| {
+        words
+            .iter()
+            .position(|word| *word == flag)
+            .and_then(|index| words.get(index + 1).copied())
+    };
+    let reply_to = value_after("--reply-to");
+    value_after("--channel") == Some(expected_channel)
+        && value_after("--content").is_some_and(|content| content != "-")
+        && reply_to.is_some_and(|event_id| {
+            event_id.len() == 64 && event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        && !words
+            .iter()
+            .any(|word| matches!(*word, "--kind" | "--broadcast" | "--file"))
 }
 
 fn file_mutation_allowed(evaluation: bool, followup_readonly: bool) -> bool {
@@ -261,6 +292,7 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
 mod evaluation_tests {
     use super::{
         evaluation_shell_command_allowed, file_mutation_allowed, followup_shell_command_allowed,
+        followup_shell_command_allowed_for,
     };
 
     #[test]
@@ -309,5 +341,30 @@ mod evaluation_tests {
         assert!(!file_mutation_allowed(false, true));
         assert!(!file_mutation_allowed(true, false));
         assert!(file_mutation_allowed(false, false));
+    }
+
+    #[test]
+    fn accepted_job_followup_allows_only_a_threaded_reply_in_its_channel() {
+        let channel = "00000000-0000-0000-0000-000000000042";
+        let event = "ab".repeat(32);
+        assert!(followup_shell_command_allowed_for(
+            &format!(
+                "buzz messages send --channel {channel} --content 'Work is checkpointed.' --reply-to {event}"
+            ),
+            channel,
+        ));
+        for command in [
+            format!("buzz messages send --channel {channel} --content - --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content ok"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --file secret"),
+            format!("buzz messages send --channel 00000000-0000-0000-0000-000000000099 --content ok --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content 'ok'; touch marker --reply-to {event}"),
+            "buzz jobs complete --job id".into(),
+        ] {
+            assert!(
+                !followup_shell_command_allowed_for(&command, channel),
+                "admitted: {command}"
+            );
+        }
     }
 }

@@ -1360,6 +1360,7 @@ fn mcp_servers_with_git_origin(
             entry.name != "BUZZ_ACP_JOB_DECISION_YIELD"
                 && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
                 && entry.name != "BUZZ_JOB_FOLLOWUP_READONLY"
+                && entry.name != "BUZZ_JOB_FOLLOWUP_CHANNEL_ID"
         });
         match capability_profile {
             SessionCapabilityProfile::JobDecision => {
@@ -1372,10 +1373,18 @@ fn mcp_servers_with_git_origin(
                     value: "1".into(),
                 });
             }
-            SessionCapabilityProfile::JobFollowupReadonly => server.env.push(EnvVar {
-                name: "BUZZ_JOB_FOLLOWUP_READONLY".into(),
-                value: "1".into(),
-            }),
+            SessionCapabilityProfile::JobFollowupReadonly => {
+                server.env.push(EnvVar {
+                    name: "BUZZ_JOB_FOLLOWUP_READONLY".into(),
+                    value: "1".into(),
+                });
+                if let Some(channel_id) = channel_id {
+                    server.env.push(EnvVar {
+                        name: "BUZZ_JOB_FOLLOWUP_CHANNEL_ID".into(),
+                        value: channel_id.to_string(),
+                    });
+                }
+            }
             SessionCapabilityProfile::Ordinary | SessionCapabilityProfile::JobExecution => {}
         }
     }
@@ -4971,9 +4980,10 @@ mod tests {
         let mut unknown = test_mcp_server();
         unknown.name = "external".into();
         unknown.command = "external-mcp".into();
+        let channel = Uuid::new_v4();
         let servers = mcp_servers_with_git_origin(
             &[test_mcp_server(), unknown],
-            Some(Uuid::new_v4()),
+            Some(channel),
             Some("stream"),
             None,
             SessionCapabilityProfile::JobFollowupReadonly,
@@ -4985,6 +4995,9 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_READONLY" && entry.value == "1"));
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_JOB_FOLLOWUP_CHANNEL_ID" && entry.value == channel.to_string()
+        }));
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(!servers[0].env.iter().any(|entry| entry.name == name));
         }
