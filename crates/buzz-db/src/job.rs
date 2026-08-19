@@ -335,6 +335,12 @@ pub(crate) async fn insert_event(
     if result.rows_affected() != 1 {
         return Err(JobWriteError::Rejected("duplicate event ID".into()));
     }
+    // Delegated-job writes bypass Db::insert_event because the event and the
+    // materialized lifecycle row must commit atomically. Keep the normal event
+    // discovery indexes in that same transaction: request reconciliation uses
+    // #p=<target>, which is served from event_mentions rather than by scanning
+    // the JSON tags column.
+    crate::insert_mentions_in_transaction(tx, community, event, Some(channel_id)).await?;
     Ok(())
 }
 
@@ -407,6 +413,11 @@ mod tests {
     }
 
     async fn cleanup(pool: &PgPool, community: CommunityId) {
+        sqlx::query("DELETE FROM event_mentions WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .execute(pool)
+            .await
+            .expect("cleanup event mentions");
         sqlx::query("DELETE FROM events WHERE community_id=$1")
             .bind(community.as_uuid())
             .execute(pool)
@@ -493,6 +504,31 @@ mod tests {
                 .await
                 .expect("query indexed job id");
         assert_eq!(indexed_job_id.as_deref(), Some(job.to_string().as_str()));
+        let indexed_target: Option<String> = sqlx::query_scalar(
+            "SELECT pubkey_hex FROM event_mentions \
+             WHERE community_id=$1 AND event_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(event.id.as_bytes().as_slice())
+        .fetch_optional(&pool)
+        .await
+        .expect("query indexed target mention");
+        let target_hex = target.public_key().to_hex();
+        assert_eq!(indexed_target.as_deref(), Some(target_hex.as_str()));
+
+        let request_by_target = crate::event::query_events(
+            &pool,
+            &crate::event::EventQuery {
+                kinds: Some(vec![buzz_core::kind::KIND_JOB_REQUEST as i32]),
+                p_tag_hex: Some(target_hex),
+                d_tag: Some(job.to_string()),
+                ..crate::event::EventQuery::for_community(community)
+            },
+        )
+        .await
+        .expect("query request by target and job coordinate");
+        assert_eq!(request_by_target.len(), 1);
+        assert_eq!(request_by_target[0].event.id, event.id);
 
         let conflict = request_event(&requester, &target, job, channel, "different assignment");
         let conflict_parsed = parse_job_request(&conflict).expect("parse conflict");
