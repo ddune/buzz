@@ -151,13 +151,13 @@ function feedHeadline(item: FeedItem, groupItems: readonly FeedItem[] = []) {
     case 43002:
       return "Job accepted";
     case 43003:
-      return "Progress update";
+      return "Job rejected";
     case 43004:
-      return "Job result";
+      return "Job completed";
     case 43005:
-      return "Job cancelled";
+      return "Job blocked";
     case 43006:
-      return "Job failed";
+      return "Job delegated";
     case 45001:
       return "Forum post";
     case 45003:

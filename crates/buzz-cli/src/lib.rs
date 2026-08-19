@@ -204,6 +204,9 @@ enum Cmd {
     /// Read the activity feed
     #[command(subcommand)]
     Feed(FeedCmd),
+    /// Create and transition structurally delegated agent jobs
+    #[command(subcommand)]
+    Jobs(JobsCmd),
     /// Publish notes and manage the social graph (NIP-01/02)
     #[command(subcommand)]
     Social(SocialCmd),
@@ -240,6 +243,72 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+}
+
+#[derive(Subcommand)]
+enum JobsCmd {
+    /// Propose executable work to exactly one managed agent
+    Create {
+        /// Target managed-agent pubkey
+        #[arg(long)]
+        target: String,
+        /// Originating channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Assignment text
+        #[arg(long)]
+        assignment: String,
+        /// Optional stable job UUID; generated when omitted
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Accept responsibility for a requested job
+    Accept(JobLifecycleArgs),
+    /// Reject a proposed job without accepting responsibility
+    Reject(JobLifecycleArgs),
+    /// Complete an accepted job
+    Complete(JobLifecycleArgs),
+    /// Close an accepted job as blocked
+    Blocked(JobLifecycleArgs),
+    /// Delegate/transfer an accepted job to another managed agent
+    Delegate {
+        #[command(flatten)]
+        job: JobLifecycleArgs,
+        /// Successor managed-agent pubkey
+        #[arg(long)]
+        successor: String,
+    },
+    /// Query the append-only event chain for a job UUID
+    Get {
+        /// Stable job UUID
+        #[arg(long)]
+        job: String,
+    },
+    /// List accepted non-terminal jobs targeting an agent
+    List {
+        /// Target managed-agent pubkey
+        #[arg(long)]
+        target: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct JobLifecycleArgs {
+    /// Stable job UUID
+    #[arg(long)]
+    job: String,
+    /// Original job-request event ID
+    #[arg(long)]
+    request: String,
+    /// Immediate predecessor event ID; required after acceptance
+    #[arg(long)]
+    parent: Option<String>,
+    /// Originating channel UUID
+    #[arg(long)]
+    channel: String,
+    /// Optional result or reason
+    #[arg(long, default_value = "")]
+    content: String,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -2048,6 +2117,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
+        Cmd::Jobs(sub) => commands::jobs::dispatch(sub, &client).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
@@ -2153,6 +2223,7 @@ mod tests {
             "emoji",
             "feed",
             "issues",
+            "jobs",
             "media",
             "mem",
             "messages",
@@ -2279,6 +2350,10 @@ mod tests {
         );
         assert_eq!(names(&cmd, "feed"), vec!["get"]);
         assert_eq!(
+            names(&cmd, "jobs"),
+            vec!["accept", "blocked", "complete", "create", "delegate", "get", "list", "reject"]
+        );
+        assert_eq!(
             names(&cmd, "social"),
             vec![
                 "contacts",
@@ -2361,6 +2436,7 @@ mod tests {
             ("emoji", 5),
             ("feed", 1),
             ("issues", 6),
+            ("jobs", 8),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),

@@ -10,11 +10,11 @@ import {
   KIND_FORUM_COMMENT,
   KIND_FORUM_POST,
   KIND_JOB_ACCEPTED,
-  KIND_JOB_CANCEL,
-  KIND_JOB_ERROR,
-  KIND_JOB_PROGRESS,
+  KIND_JOB_BLOCKED,
+  KIND_JOB_DELEGATED,
+  KIND_JOB_REJECTED,
   KIND_JOB_REQUEST,
-  KIND_JOB_RESULT,
+  KIND_JOB_COMPLETED,
   KIND_REMINDER,
 } from "@/shared/constants/kinds";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
@@ -66,14 +66,14 @@ function feedHeadline(item: FeedItem) {
       return "Job requested";
     case KIND_JOB_ACCEPTED:
       return "Job accepted";
-    case KIND_JOB_PROGRESS:
-      return "Progress update";
-    case KIND_JOB_RESULT:
-      return "Job result";
-    case KIND_JOB_CANCEL:
-      return "Job cancelled";
-    case KIND_JOB_ERROR:
-      return "Job failed";
+    case KIND_JOB_REJECTED:
+      return "Job rejected";
+    case KIND_JOB_COMPLETED:
+      return "Job completed";
+    case KIND_JOB_BLOCKED:
+      return "Job blocked";
+    case KIND_JOB_DELEGATED:
+      return "Job delegated";
     case KIND_FORUM_POST:
       return "Forum post";
     case KIND_FORUM_COMMENT:

@@ -21,8 +21,9 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED, KIND_JOB_DELEGATED, KIND_JOB_REJECTED,
+    KIND_JOB_REQUEST, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -2103,6 +2104,7 @@ async fn tokio_main() -> Result<()> {
                 kinds: config.kinds_override.clone().unwrap_or_else(|| {
                     vec![
                         KIND_STREAM_MESSAGE,
+                        KIND_JOB_REQUEST,
                         KIND_WORKFLOW_APPROVAL_REQUESTED,
                         KIND_STREAM_REMINDER,
                     ]
@@ -2914,6 +2916,50 @@ async fn tokio_main() -> Result<()> {
                                     );
                                     continue;
                                 }
+                            }
+
+                            // Delegated jobs have their own structural ingress.
+                            // They bypass conversational subscription matching
+                            // and remain isolated as job-only FlushBatches.
+                            if buzz_event.event.kind.as_u16() as u32 == KIND_JOB_REQUEST {
+                                let request = match buzz_core::delegated_job::parse_job_request(&buzz_event.event) {
+                                    Ok(request) => request,
+                                    Err(error) => {
+                                        tracing::warn!(event_id=%buzz_event.event.id, "dropping malformed delegated job after relay ingest: {error}");
+                                        continue;
+                                    }
+                                };
+                                if request.target_agent != pubkey_hex
+                                    || request.channel_id != buzz_event.channel_id
+                                {
+                                    tracing::warn!(event_id=%buzz_event.event.id, "dropping delegated job with mismatched target or channel");
+                                    continue;
+                                }
+                                let accepted = queue.push(QueuedEvent {
+                                    channel_id: buzz_event.channel_id,
+                                    event: buzz_event.event,
+                                    received_at: std::time::Instant::now(),
+                                    prompt_tag: "delegated-job-request".into(),
+                                });
+                                if accepted && pool_ready {
+                                    for (channel_id, thread_tags) in
+                                        dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                    {
+                                        typing_channels.insert(channel_id, thread_tags);
+                                    }
+                                }
+                                continue;
+                            }
+                            if matches!(
+                                buzz_event.event.kind.as_u16() as u32,
+                                KIND_JOB_ACCEPTED
+                                    | KIND_JOB_REJECTED
+                                    | KIND_JOB_COMPLETED
+                                    | KIND_JOB_BLOCKED
+                                    | KIND_JOB_DELEGATED
+                            ) {
+                                tracing::debug!(event_id=%buzz_event.event.id, "job lifecycle state is control-plane data, not conversational input");
+                                continue;
                             }
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;

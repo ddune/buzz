@@ -21,20 +21,21 @@ use buzz_core::kind::{
     KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
     KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT, KIND_REACTION,
-    KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
-    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
-    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
-    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_IA_UNARCHIVE_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED,
+    KIND_JOB_DELEGATED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
+    KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE,
+    KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -389,7 +390,13 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_STREAM_MESSAGE_DIFF
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
-        | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
+        | KIND_FORUM_COMMENT
+        | KIND_JOB_REQUEST
+        | KIND_JOB_ACCEPTED
+        | KIND_JOB_REJECTED
+        | KIND_JOB_COMPLETED
+        | KIND_JOB_BLOCKED
+        | KIND_JOB_DELEGATED => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
@@ -624,6 +631,12 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_FORUM_POST
             | KIND_FORUM_VOTE
             | KIND_FORUM_COMMENT
+            | KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_REJECTED
+            | KIND_JOB_COMPLETED
+            | KIND_JOB_BLOCKED
+            | KIND_JOB_DELEGATED
             // NIP-29 admin kinds (except CREATE_GROUP which creates the channel)
             | KIND_NIP29_PUT_USER
             | KIND_NIP29_REMOVE_USER
@@ -2694,6 +2707,132 @@ async fn ingest_event_inner(
         }
     }
 
+    if kind_u32 == KIND_JOB_REQUEST {
+        let request = buzz_core::delegated_job::parse_job_request(&event)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        let target = hex::decode(&request.target_agent)
+            .map_err(|_| IngestError::Rejected("invalid: malformed job target".into()))?;
+        let requester = event.pubkey.to_bytes();
+        let authorized = state
+            .db
+            .is_agent_owner(tenant.community(), &target, &requester)
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: {error}")))?;
+        if !authorized {
+            return Err(IngestError::AuthFailed(
+                "restricted: only the registered owner may request a job for this managed agent"
+                    .into(),
+            ));
+        }
+        let target_is_member = state
+            .is_member_cached(tenant.community(), request.channel_id, &target)
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: {error}")))?;
+        if !target_is_member {
+            return Err(IngestError::AuthFailed(
+                "restricted: target managed agent is not a member of the originating channel"
+                    .into(),
+            ));
+        }
+        let outcome = state
+            .db
+            .accept_job_request(tenant.community(), &event, &request)
+            .await
+            .map_err(|error| match error {
+                buzz_db::job::JobWriteError::Rejected(reason) => {
+                    IngestError::Rejected(format!("invalid: {reason}"))
+                }
+                buzz_db::job::JobWriteError::Database(error) => {
+                    IngestError::Internal(format!("error: {error}"))
+                }
+            })?;
+        if outcome.was_inserted {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &outcome.stored_event,
+                kind_u32,
+                &event.pubkey.to_hex(),
+                threaded_visibility.clone(),
+            )
+            .await;
+        }
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: if outcome.was_inserted {
+                String::new()
+            } else {
+                "duplicate: identical event".into()
+            },
+        });
+    }
+
+    if matches!(
+        kind_u32,
+        KIND_JOB_ACCEPTED
+            | KIND_JOB_REJECTED
+            | KIND_JOB_COMPLETED
+            | KIND_JOB_BLOCKED
+            | KIND_JOB_DELEGATED
+    ) {
+        let lifecycle = buzz_core::delegated_job::parse_job_lifecycle(&event)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        if let Some(successor_hex) = lifecycle.successor_agent.as_deref() {
+            let existing = state
+                .db
+                .get_job(tenant.community(), lifecycle.job_id)
+                .await
+                .map_err(|error| IngestError::Internal(format!("error: {error}")))?
+                .ok_or_else(|| IngestError::Rejected("invalid: unknown job ID".into()))?;
+            let successor = hex::decode(successor_hex)
+                .map_err(|_| IngestError::Rejected("invalid: malformed successor".into()))?;
+            let authorized = state
+                .db
+                .is_agent_owner(tenant.community(), &successor, &existing.requester)
+                .await
+                .map_err(|error| IngestError::Internal(format!("error: {error}")))?;
+            if !authorized {
+                return Err(IngestError::AuthFailed(
+                    "restricted: transfer successor must be a managed agent of the requester"
+                        .into(),
+                ));
+            }
+        }
+        let outcome = state
+            .db
+            .accept_job_lifecycle(tenant.community(), &event, &lifecycle)
+            .await
+            .map_err(|error| match error {
+                buzz_db::job::JobWriteError::Rejected(reason) => {
+                    IngestError::Rejected(format!("invalid: {reason}"))
+                }
+                buzz_db::job::JobWriteError::Database(error) => {
+                    IngestError::Internal(format!("error: {error}"))
+                }
+            })?;
+        if outcome.was_inserted {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &outcome.stored_event,
+                kind_u32,
+                &event.pubkey.to_hex(),
+                threaded_visibility.clone(),
+            )
+            .await;
+        }
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: if outcome.was_inserted {
+                String::new()
+            } else {
+                "duplicate: identical event".into()
+            },
+        });
+    }
+
     if kind_u32 == super::push_lease::KIND_PUSH_LEASE {
         let outcome = super::push_lease::accept(tenant, state, &event, now)
             .await
@@ -3391,6 +3530,26 @@ mod tests {
             assert!(
                 requires_h_channel_scope(kind),
                 "kind {kind} should require h"
+            );
+        }
+    }
+
+    #[test]
+    fn delegated_job_kinds_are_channel_scoped_messages_write_events() {
+        let dummy = make_dummy_event();
+        for kind in [
+            KIND_JOB_REQUEST,
+            KIND_JOB_ACCEPTED,
+            KIND_JOB_REJECTED,
+            KIND_JOB_COMPLETED,
+            KIND_JOB_BLOCKED,
+            KIND_JOB_DELEGATED,
+        ] {
+            assert!(requires_h_channel_scope(kind), "kind {kind} must require h");
+            assert!(!is_global_only_kind(kind), "kind {kind} must not be global");
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite
             );
         }
     }

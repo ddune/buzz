@@ -1,9 +1,9 @@
 import {
   KIND_APPROVAL_REQUEST,
   KIND_JOB_ACCEPTED,
-  KIND_JOB_ERROR,
-  KIND_JOB_PROGRESS,
-  KIND_JOB_RESULT,
+  KIND_JOB_BLOCKED,
+  KIND_JOB_COMPLETED,
+  KIND_JOB_REJECTED,
 } from "@/shared/constants/kinds";
 import type { FeedItemCategory } from "@/shared/api/types";
 
@@ -46,16 +46,7 @@ export const SLOT_LABELS: Record<SoundSlot, string> = {
   job_error: "Agent: job error",
 };
 
-// The agent job protocol (kinds 43001-43006) is defined and queryable but
-// nothing emits the events yet — buzz-acp publishes plain stream messages.
-// These slots stay wired (resolver, defaults, settings) but render disabled
-// with a "coming soon" badge until an emitter exists.
-export const COMING_SOON_SLOTS: ReadonlySet<SoundSlot> = new Set([
-  "job_accepted",
-  "job_progress",
-  "job_result",
-  "job_error",
-]);
+export const COMING_SOON_SLOTS: ReadonlySet<SoundSlot> = new Set();
 
 export const SLOT_DESCRIPTIONS: Record<SoundSlot, string> = {
   dm: "When someone messages you directly.",
@@ -121,9 +112,9 @@ export function slotForFeedKind(
 ): SoundSlot {
   if (category === "mention") return "mention";
   if (kind === KIND_JOB_ACCEPTED) return "job_accepted";
-  if (kind === KIND_JOB_PROGRESS) return "job_progress";
-  if (kind === KIND_JOB_RESULT) return "job_result";
-  if (kind === KIND_JOB_ERROR) return "job_error";
+  if (kind === KIND_JOB_REJECTED) return "job_progress";
+  if (kind === KIND_JOB_COMPLETED) return "job_result";
+  if (kind === KIND_JOB_BLOCKED) return "job_error";
   if (kind === KIND_APPROVAL_REQUEST) return "needs_action";
   return "needs_action";
 }

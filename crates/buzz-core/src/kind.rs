@@ -518,14 +518,14 @@ pub const KIND_DM_CREATED: u32 = 41001;
 pub const KIND_JOB_REQUEST: u32 = 43001;
 /// An agent accepted a job request.
 pub const KIND_JOB_ACCEPTED: u32 = 43002;
-/// Progress update for an in-flight agent job.
-pub const KIND_JOB_PROGRESS: u32 = 43003;
-/// Final result of a completed agent job.
-pub const KIND_JOB_RESULT: u32 = 43004;
-/// A job cancellation was requested.
-pub const KIND_JOB_CANCEL: u32 = 43005;
-/// An agent job failed with an error.
-pub const KIND_JOB_ERROR: u32 = 43006;
+/// The target agent rejected a proposed job without accepting responsibility.
+pub const KIND_JOB_REJECTED: u32 = 43003;
+/// The target agent completed an accepted job.
+pub const KIND_JOB_COMPLETED: u32 = 43004;
+/// The target agent is blocked on an accepted job.
+pub const KIND_JOB_BLOCKED: u32 = 43005;
+/// The target agent delegated/transferred an accepted job to a successor.
+pub const KIND_JOB_DELEGATED: u32 = 43006;
 
 /// Relay-signed notification: the target pubkey was added to a channel.
 /// Stored globally (channel_id = None) with p-tag = target, h-tag = channel UUID.
@@ -718,10 +718,10 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_DM_CREATED,
     KIND_JOB_REQUEST,
     KIND_JOB_ACCEPTED,
-    KIND_JOB_PROGRESS,
-    KIND_JOB_RESULT,
-    KIND_JOB_CANCEL,
-    KIND_JOB_ERROR,
+    KIND_JOB_REJECTED,
+    KIND_JOB_COMPLETED,
+    KIND_JOB_BLOCKED,
+    KIND_JOB_DELEGATED,
     KIND_MEMBER_ADDED_NOTIFICATION,
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_AGENT_TURN_METRIC,
