@@ -3367,9 +3367,9 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                if let Some(evaluation) = completed_evaluation.filter(|evaluation| {
-                    pending_job_promotions.remove(&evaluation.job_id).is_some()
-                }) {
+                if let Some(evaluation) =
+                    take_pending_job_promotion(&mut pending_job_promotions, completed_evaluation)
+                {
                     tracing::info!(
                         job_id = %evaluation.job_id,
                         channel_id = %evaluation.channel_id,
@@ -3386,7 +3386,7 @@ async fn tokio_main() -> Result<()> {
                     )
                     .await;
                 }
-                if drain_ready_join_results(
+                let (drain_action, panicked_evaluations) = drain_ready_join_results(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3397,8 +3397,28 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                ) == LoopAction::Exit
-                {
+                );
+                for evaluation in panicked_evaluations {
+                    if let Some(evaluation) =
+                        take_pending_job_promotion(&mut pending_job_promotions, Some(evaluation))
+                    {
+                        tracing::info!(
+                            job_id = %evaluation.job_id,
+                            channel_id = %evaluation.channel_id,
+                            channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                            "panicked evaluation released; promoting accepted job"
+                        );
+                        promote_accepted_job(
+                            &ctx.rest_client,
+                            &mut queue,
+                            &mut queued_job_attempts,
+                            &evaluation,
+                            config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                        )
+                        .await;
+                    }
+                }
+                if drain_action == LoopAction::Exit {
                     break;
                 }
                 for (channel_id, thread_tags) in
@@ -3433,7 +3453,7 @@ async fn tokio_main() -> Result<()> {
                     }
                 }
                 tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                let panicked_evaluation = recover_panicked_agent(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3446,6 +3466,24 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if let Some(evaluation) =
+                    take_pending_job_promotion(&mut pending_job_promotions, panicked_evaluation)
+                {
+                    tracing::info!(
+                        job_id = %evaluation.job_id,
+                        channel_id = %evaluation.channel_id,
+                        channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                        "panicked evaluation released; promoting accepted job"
+                    );
+                    promote_accepted_job(
+                        &ctx.rest_client,
+                        &mut queue,
+                        &mut queued_job_attempts,
+                        &evaluation,
+                        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                    )
+                    .await;
+                }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
@@ -4133,6 +4171,14 @@ async fn promote_accepted_job(
     );
 }
 
+fn take_pending_job_promotion(
+    pending: &mut HashMap<Uuid, job_execution::JobEvaluationContext>,
+    evaluation: Option<job_execution::JobEvaluationContext>,
+) -> Option<job_execution::JobEvaluationContext> {
+    let evaluation = evaluation?;
+    pending.remove(&evaluation.job_id).map(|_| evaluation)
+}
+
 /// Flush queued work to available agents.
 fn enqueue_job_continuations(
     queue: &mut EventQueue,
@@ -4817,13 +4863,14 @@ fn recover_panicked_agent(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) {
+) -> Option<job_execution::JobEvaluationContext> {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
         tracing::error!("panic for unknown task {task_id:?} — bug");
-        return;
+        return None;
     };
     let i = meta.agent_index;
+    let job_evaluation = meta.job_evaluation.clone();
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -4871,7 +4918,7 @@ fn recover_panicked_agent(
     let delay = match slot.record_crash() {
         CrashVerdict::CircuitOpen => {
             tracing::error!(agent = i, "circuit open after panic — not respawning");
-            return;
+            return job_evaluation;
         }
         CrashVerdict::HalfOpenProbe => {
             tracing::info!(agent = i, "circuit half-open — probe respawn after panic");
@@ -4901,6 +4948,7 @@ fn recover_panicked_agent(
         let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
+    job_evaluation
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4915,11 +4963,12 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) -> LoopAction {
+) -> (LoopAction, Vec<job_execution::JobEvaluationContext>) {
+    let mut panicked_evaluations = Vec::new();
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            if let Some(evaluation) = recover_panicked_agent(
                 pool,
                 queue,
                 config,
@@ -4931,13 +4980,15 @@ fn drain_ready_join_results(
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
-            );
+            ) {
+                panicked_evaluations.push(evaluation);
+            }
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                return LoopAction::Exit;
+                return (LoopAction::Exit, panicked_evaluations);
             }
         }
     }
-    LoopAction::Continue
+    (LoopAction::Continue, panicked_evaluations)
 }
 
 fn dispatch_heartbeat(
@@ -8333,7 +8384,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
 
-        recover_panicked_agent(
+        let recovered_evaluation = recover_panicked_agent(
             &mut pool,
             &mut queue,
             &config,
@@ -8346,6 +8397,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
         );
+        assert!(recovered_evaluation.is_none());
 
         let panic = observer
             .snapshot()
@@ -8357,6 +8409,88 @@ mod error_outcome_emission_tests {
             Some(channel_id.to_string().as_str())
         );
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+    }
+
+    #[tokio::test]
+    async fn accepted_evaluation_panic_releases_channel_and_returns_pending_promotion() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let evaluation = job_execution::JobEvaluationContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "request-event-id".to_string(),
+            channel_id,
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let task_id = abort_handle.id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "accepted-panic-turn".to_string(),
+                job_execution: None,
+                job_evaluation: Some(evaluation.clone()),
+                job_evaluation_decided: true,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let request = EventBuilder::new(Kind::Custom(43001), "proposal")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event: request,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "job-evaluation".to_string(),
+        }));
+        assert!(queue.flush_next().is_some());
+        assert!(queue.is_channel_in_flight(channel_id));
+
+        let mut pending = HashMap::from([(evaluation.job_id, evaluation.clone())]);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        let recovered_evaluation = recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+        );
+
+        assert!(!queue.is_channel_in_flight(channel_id));
+        assert_eq!(
+            take_pending_job_promotion(&mut pending, recovered_evaluation),
+            Some(evaluation)
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
