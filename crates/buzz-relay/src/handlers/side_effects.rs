@@ -37,6 +37,18 @@ pub fn is_side_effect_kind(kind: u32) -> bool {
     matches!(kind, 0 | 5 | 9000..=9022 | KIND_GIT_REPO_ANNOUNCEMENT | KIND_AGENT_PROFILE | 41001..=41003 | 40099)
 }
 
+fn is_delegated_job_event(event: &Event) -> bool {
+    matches!(
+        event_kind_u32(event),
+        KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_REJECTED
+            | KIND_JOB_COMPLETED
+            | KIND_JOB_BLOCKED
+            | KIND_JOB_DELEGATED
+    )
+}
+
 async fn evict_live_channel_subscriptions(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -267,15 +279,7 @@ pub async fn validate_standard_deletion_event(
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
 
-        if matches!(
-            event_kind_u32(&target_event.event),
-            KIND_JOB_REQUEST
-                | KIND_JOB_ACCEPTED
-                | KIND_JOB_REJECTED
-                | KIND_JOB_COMPLETED
-                | KIND_JOB_BLOCKED
-                | KIND_JOB_DELEGATED
-        ) {
+        if is_delegated_job_event(&target_event.event) {
             return Err(anyhow::anyhow!(
                 "delegated job history is append-only and cannot be deleted"
             ));
@@ -674,6 +678,12 @@ pub async fn validate_admin_event(
                 .await
                 .map_err(|e| anyhow::anyhow!("db error looking up target: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+
+            if is_delegated_job_event(&target_event.event) {
+                return Err(anyhow::anyhow!(
+                    "delegated job history is append-only and cannot be deleted"
+                ));
+            }
 
             match target_event.channel_id {
                 Some(target_ch) if target_ch != channel_id => {
