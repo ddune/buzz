@@ -313,6 +313,11 @@ mod tests {
     }
 
     async fn cleanup(pool: &PgPool, community: CommunityId) {
+        sqlx::query("DELETE FROM event_mentions WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .execute(pool)
+            .await
+            .expect("event mentions");
         sqlx::query("DELETE FROM events WHERE community_id=$1")
             .bind(community.as_uuid())
             .execute(pool)
@@ -382,6 +387,158 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(count, 1);
+        cleanup(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn acceptance_cancel_release_promotes_and_claims_before_runtime_callback() {
+        let (pool, community, channel, _, target, job_id, request, acceptance) = fixture().await;
+        let mut evaluation_in_flight = true;
+        job::accept_lifecycle(
+            &pool,
+            community,
+            &acceptance,
+            &parse_job_lifecycle(&acceptance).expect("parse acceptance"),
+        )
+        .await
+        .expect("accept job");
+        assert!(
+            evaluation_in_flight,
+            "acceptance cannot itself start execution"
+        );
+
+        let before_attempts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM job_execution_attempts WHERE community_id=$1 AND job_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count before reconciliation");
+        assert_eq!(
+            before_attempts, 0,
+            "acceptance alone is not an execution attempt"
+        );
+
+        // Service-backed stand-in for the ACP Rotate acknowledgement and
+        // EventQueue::mark_complete seam. Promotion is deliberately below it.
+        evaluation_in_flight = false;
+        let promotion_started = std::time::Instant::now();
+
+        let attempt_id = Uuid::new_v4();
+        let runnable = attempt_event(
+            &target, job_id, &request, channel, attempt_id, 1, "runnable", None, None, None,
+        );
+        accept(
+            &pool,
+            community,
+            &runnable,
+            &parse_execution_attempt(&runnable).expect("parse runnable"),
+        )
+        .await
+        .expect("persist generation one runnable");
+
+        let turn_id = "preallocated-generation-one-turn";
+        let claim = attempt_event(
+            &target,
+            job_id,
+            &request,
+            channel,
+            attempt_id,
+            1,
+            "claim",
+            Some(&runnable.id.to_hex()),
+            Some(turn_id),
+            None,
+        );
+        accept(
+            &pool,
+            community,
+            &claim,
+            &parse_execution_attempt(&claim).expect("parse claim"),
+        )
+        .await
+        .expect("persist generation one claim");
+        assert!(
+            promotion_started.elapsed() < std::time::Duration::from_secs(5),
+            "decision-driven promotion must not depend on the 15-second recovery timer"
+        );
+
+        // This closure is the service-backed stand-in for runtime dispatch.
+        // It is intentionally invoked only after a read-back proves the
+        // generation, attempt, runnable, claim, turn, and valid lease exist.
+        let row = sqlx::query(
+            "SELECT generation,attempt_id,status,runnable_event_id,claim_event_id,turn_id,lease_expires_at \
+             FROM job_execution_attempts WHERE community_id=$1 AND job_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read active attempt before dispatch");
+        assert_eq!(row.try_get::<i64, _>("generation").expect("generation"), 1);
+        assert_eq!(
+            row.try_get::<Uuid, _>("attempt_id").expect("attempt"),
+            attempt_id
+        );
+        assert_eq!(
+            row.try_get::<String, _>("status").expect("status"),
+            "active"
+        );
+        assert_eq!(
+            row.try_get::<Vec<u8>, _>("runnable_event_id")
+                .expect("runnable"),
+            runnable.id.as_bytes().to_vec()
+        );
+        assert_eq!(
+            row.try_get::<Vec<u8>, _>("claim_event_id").expect("claim"),
+            claim.id.as_bytes().to_vec()
+        );
+        assert_eq!(row.try_get::<String, _>("turn_id").expect("turn"), turn_id);
+        assert!(row
+            .try_get::<Option<DateTime<Utc>>, _>("lease_expires_at")
+            .expect("lease")
+            .is_some_and(|lease| lease > Utc::now()));
+        let mut runtime_callback_fired = false;
+        let runtime_callback = |fired: &mut bool| {
+            assert!(!evaluation_in_flight, "evaluation must be released first");
+            *fired = true;
+        };
+        runtime_callback(&mut runtime_callback_fired);
+        assert!(runtime_callback_fired);
+
+        let completion = EventBuilder::new(Kind::Custom(KIND_JOB_COMPLETED as u16), "done")
+            .tags([
+                Tag::parse(["d", &job_id.to_string()]).expect("tag"),
+                Tag::parse(["job-request", &request.id.to_hex()]).expect("tag"),
+                Tag::parse(["job-parent", &acceptance.id.to_hex()]).expect("tag"),
+                Tag::parse(["h", &channel.to_string()]).expect("tag"),
+            ])
+            .sign_with_keys(&target)
+            .expect("completion");
+        job::accept_lifecycle(
+            &pool,
+            community,
+            &completion,
+            &parse_job_lifecycle(&completion).expect("parse completion"),
+        )
+        .await
+        .expect("complete job");
+        let live_attempts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM job_execution_attempts \
+             WHERE community_id=$1 AND job_id=$2 AND status IN ('runnable','active')",
+        )
+        .bind(community.as_uuid())
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count live attempts after completion");
+        assert_eq!(
+            live_attempts, 0,
+            "terminal disposition suppresses continuation"
+        );
+
         cleanup(&pool, community).await;
     }
 

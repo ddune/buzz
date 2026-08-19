@@ -1277,8 +1277,8 @@ pub fn resolve_channel_filters(
     rules: &[SubscriptionRule],
 ) -> HashMap<Uuid, ChannelFilter> {
     use buzz_core::kind::{
-        KIND_JOB_REQUEST, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
-        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_JOB_ACCEPTED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_STREAM_MESSAGE,
+        KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
 
     let target_channels: Vec<Uuid> = if let Some(ref overrides) = config.channels_override {
@@ -1365,7 +1365,8 @@ pub fn resolve_channel_filters(
 
     // Delegated-job ingress is an invariant control-plane subscription, not a
     // conversational rule. Every channel where this agent is a discovered
-    // member must admit targeted 43001 events even when kind overrides or
+    // member must admit targeted requests plus the target-authored decision
+    // events that close evaluation turns, even when kind overrides or
     // config-mode rules omit ordinary conversational traffic.
     for channel_id in discovered_channels {
         let filter = result.entry(*channel_id).or_insert_with(|| ChannelFilter {
@@ -1373,10 +1374,16 @@ pub fn resolve_channel_filters(
             require_mention: true,
         });
         if let Some(kinds) = &mut filter.kinds {
-            if !kinds.contains(&KIND_JOB_REQUEST) {
-                kinds.push(KIND_JOB_REQUEST);
+            for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
             }
         }
+        // Lifecycle decision events deliberately forbid `p`, so a relay-side
+        // mention filter would make the structural turn boundary invisible.
+        // Conversational mention policy is still enforced locally by rules.
+        filter.require_mention = false;
     }
 
     result
@@ -1392,8 +1399,8 @@ pub fn resolve_dynamic_channel_filter(
     rules: &[crate::filter::SubscriptionRule],
 ) -> Option<ChannelFilter> {
     use buzz_core::kind::{
-        KIND_JOB_REQUEST, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
-        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_JOB_ACCEPTED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_STREAM_MESSAGE,
+        KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
 
     // In Mentions/All mode, if the operator explicitly constrained channels
@@ -1407,35 +1414,54 @@ pub fn resolve_dynamic_channel_filter(
                 .any(|s| s.parse::<Uuid>().ok() == Some(channel_id));
             if !allowed {
                 return Some(ChannelFilter {
-                    kinds: Some(vec![KIND_JOB_REQUEST]),
-                    require_mention: true,
+                    kinds: Some(vec![KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED]),
+                    require_mention: false,
                 });
             }
         }
     }
 
     match config.subscribe_mode {
-        SubscribeMode::Mentions => Some(ChannelFilter {
-            kinds: Some(config.kinds_override.clone().unwrap_or_else(|| {
+        SubscribeMode::Mentions => {
+            let mut kinds = config.kinds_override.clone().unwrap_or_else(|| {
                 vec![
                     KIND_STREAM_MESSAGE,
                     KIND_JOB_REQUEST,
                     KIND_WORKFLOW_APPROVAL_REQUESTED,
                     KIND_STREAM_REMINDER,
                 ]
-            })),
-            require_mention: !config.no_mention_filter,
-        }),
-        SubscribeMode::All => Some(ChannelFilter {
-            kinds: config.kinds_override.clone(),
-            require_mention: false,
-        }),
+            });
+            for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            Some(ChannelFilter {
+                kinds: Some(kinds),
+                // Decision events forbid `p`; conversational mentions remain
+                // locally filtered by match_event.
+                require_mention: false,
+            })
+        }
+        SubscribeMode::All => {
+            let mut kinds = config.kinds_override.clone();
+            if let Some(kinds) = &mut kinds {
+                for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+            }
+            Some(ChannelFilter {
+                kinds,
+                require_mention: false,
+            })
+        }
         SubscribeMode::Config => {
             // Same merge logic as resolve_channel_filters() Config branch:
             // evaluate ALL rules against this specific channel (including
             // channel-specific rules, not just ChannelScope::All).
             let mut merged_kinds: Option<Vec<u32>> = Some(vec![]);
-            let mut require_mention = true;
             let mut has_rule = false;
 
             for rule in rules {
@@ -1452,26 +1478,27 @@ pub fn resolve_dynamic_channel_filter(
                         }
                     }
                 }
-                if !rule.require_mention {
-                    require_mention = false;
-                }
             }
 
             if !has_rule {
                 return Some(ChannelFilter {
-                    kinds: Some(vec![KIND_JOB_REQUEST]),
-                    require_mention: true,
+                    kinds: Some(vec![KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED]),
+                    require_mention: false,
                 });
             }
 
             if let Some(kinds) = &mut merged_kinds {
-                if !kinds.contains(&KIND_JOB_REQUEST) {
-                    kinds.push(KIND_JOB_REQUEST);
+                for kind in [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED] {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
                 }
             }
             Some(ChannelFilter {
                 kinds: merged_kinds,
-                require_mention,
+                // The combined relay subscription must admit decision events,
+                // which cannot carry `p`. Rules retain the local policy.
+                require_mention: false,
             })
         }
     }
@@ -1572,7 +1599,10 @@ mod tests {
         assert_eq!(result.len(), 2);
         for ch in &channels {
             let f = result.get(ch).expect("channel should be present");
-            assert!(f.require_mention, "mentions mode requires mention");
+            assert!(
+                !f.require_mention,
+                "relay subscription must admit decision events without p tags"
+            );
             let kinds = f.kinds.as_ref().expect("should have kinds");
             assert!(kinds.contains(&buzz_core::kind::KIND_STREAM_MESSAGE));
             assert!(kinds.contains(&buzz_core::kind::KIND_JOB_REQUEST));
@@ -1591,7 +1621,13 @@ mod tests {
         let f = result.get(&channels[0]).unwrap();
         assert_eq!(
             f.kinds.as_ref().unwrap(),
-            &[1, 7, buzz_core::kind::KIND_JOB_REQUEST]
+            &[
+                1,
+                7,
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_ACCEPTED,
+                buzz_core::kind::KIND_JOB_REJECTED,
+            ]
         );
     }
 
@@ -1858,7 +1894,13 @@ mod tests {
         let f = result.get(&channels[0]).unwrap();
         assert_eq!(
             f.kinds.as_ref().unwrap(),
-            &[9, 7, buzz_core::kind::KIND_JOB_REQUEST]
+            &[
+                9,
+                7,
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_ACCEPTED,
+                buzz_core::kind::KIND_JOB_REJECTED,
+            ]
         );
     }
 
@@ -1879,7 +1921,13 @@ mod tests {
         assert!(result.contains_key(&ch_a));
         assert_eq!(
             result.get(&ch_b).and_then(|filter| filter.kinds.as_deref()),
-            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+            Some(
+                &[
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    buzz_core::kind::KIND_JOB_ACCEPTED,
+                    buzz_core::kind::KIND_JOB_REJECTED,
+                ][..]
+            )
         );
         assert!(!result.contains_key(&ch_unknown));
     }
@@ -1900,7 +1948,12 @@ mod tests {
         let f = result.get(&ch).unwrap();
         assert_eq!(
             f.kinds.as_ref().unwrap(),
-            &[9, buzz_core::kind::KIND_JOB_REQUEST]
+            &[
+                9,
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_ACCEPTED,
+                buzz_core::kind::KIND_JOB_REJECTED,
+            ]
         );
         assert!(!f.require_mention);
     }
@@ -1922,7 +1975,13 @@ mod tests {
         assert!(result.contains_key(&ch_a));
         assert_eq!(
             result.get(&ch_b).and_then(|filter| filter.kinds.as_deref()),
-            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+            Some(
+                &[
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    buzz_core::kind::KIND_JOB_ACCEPTED,
+                    buzz_core::kind::KIND_JOB_REJECTED,
+                ][..]
+            )
         );
     }
 
@@ -1979,9 +2038,15 @@ mod tests {
         let filter = result.get(&ch).expect("job-only filter");
         assert_eq!(
             filter.kinds.as_deref(),
-            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+            Some(
+                &[
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    buzz_core::kind::KIND_JOB_ACCEPTED,
+                    buzz_core::kind::KIND_JOB_REJECTED,
+                ][..]
+            )
         );
-        assert!(filter.require_mention);
+        assert!(!filter.require_mention);
     }
 
     #[test]

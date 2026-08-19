@@ -2226,6 +2226,7 @@ async fn tokio_main() -> Result<()> {
     });
 
     let mut queued_job_attempts = HashSet::new();
+    let mut pending_job_promotions = HashMap::<Uuid, job_execution::JobEvaluationContext>::new();
     match job_execution::reconcile(
         &ctx.rest_client,
         &queued_job_attempts,
@@ -2786,6 +2787,77 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            // Accept/reject is a structural boundary for a
+                            // delegated-job evaluation turn. Observe our own
+                            // lifecycle events before the generic ignore-self
+                            // gate: the target agent authors these events. On
+                            // acceptance, stop the proposal turn and establish
+                            // runnable generation 1 + its claim before any
+                            // repository execution is dispatched.
+                            if matches!(kind_u32, KIND_JOB_ACCEPTED | KIND_JOB_REJECTED) {
+                                let lifecycle = buzz_core::delegated_job::parse_job_lifecycle(
+                                    &buzz_event.event,
+                                );
+                                if let Ok(lifecycle) = lifecycle {
+                                    let evaluation = job_execution::JobEvaluationContext {
+                                        job_id: lifecycle.job_id,
+                                        request_event_id: lifecycle.request_event_id,
+                                        channel_id: lifecycle.channel_id,
+                                    };
+                                    if lifecycle.author == pubkey_hex
+                                        && lifecycle.channel_id == buzz_event.channel_id
+                                    {
+                                        let stopped = signal_job_evaluation_boundary(
+                                            &mut pool,
+                                            &evaluation,
+                                        );
+                                        tracing::info!(
+                                            job_id = %evaluation.job_id,
+                                            request_event_id = %evaluation.request_event_id,
+                                            stopped,
+                                            kind = kind_u32,
+                                            "delegated-job decision closed its evaluation turn"
+                                        );
+                                        if kind_u32 == KIND_JOB_ACCEPTED {
+                                            tracing::info!(
+                                                job_id = %evaluation.job_id,
+                                                acceptance_event_id = %buzz_event.event.id,
+                                                channel_id = %evaluation.channel_id,
+                                                channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                                                stopped,
+                                                "matching delegated-job acceptance observed"
+                                            );
+                                            if stopped
+                                                || queue.is_channel_in_flight(evaluation.channel_id)
+                                            {
+                                                pending_job_promotions
+                                                    .insert(evaluation.job_id, evaluation);
+                                            } else {
+                                                promote_accepted_job(
+                                                    &ctx.rest_client,
+                                                    &mut queue,
+                                                    &mut queued_job_attempts,
+                                                    &evaluation,
+                                                    config.max_turn_duration_secs
+                                                        + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                                                ).await;
+                                                if pool_ready {
+                                                    for (channel_id, thread_tags) in dispatch_pending(
+                                                        &mut pool,
+                                                        &mut queue,
+                                                        &ctx,
+                                                        &mut last_activity,
+                                                    ) {
+                                                        typing_channels.insert(channel_id, thread_tags);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
@@ -3252,6 +3324,20 @@ async fn tokio_main() -> Result<()> {
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
+                let completed_evaluation = pool
+                    .task_map()
+                    .values()
+                    .find(|meta| meta.agent_index == result.agent.index)
+                    .and_then(|meta| meta.job_evaluation.clone());
+                let completed_evaluation_session =
+                    completed_evaluation.as_ref().and_then(|evaluation| {
+                        result
+                            .agent
+                            .state
+                            .sessions
+                            .get(&evaluation.channel_id)
+                            .cloned()
+                    });
                 if let Some(attempt_id) = pool
                     .task_map()
                     .values()
@@ -3281,7 +3367,26 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                if drain_ready_join_results(
+                if let Some(evaluation) =
+                    take_pending_job_promotion(&mut pending_job_promotions, completed_evaluation)
+                {
+                    tracing::info!(
+                        job_id = %evaluation.job_id,
+                        channel_id = %evaluation.channel_id,
+                        channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                        evaluation_session_id = completed_evaluation_session.as_deref().unwrap_or("<rotated>"),
+                        "evaluation cancellation completed; promoting accepted job"
+                    );
+                    promote_accepted_job(
+                        &ctx.rest_client,
+                        &mut queue,
+                        &mut queued_job_attempts,
+                        &evaluation,
+                        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                    )
+                    .await;
+                }
+                let (drain_action, panicked_evaluations) = drain_ready_join_results(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3292,9 +3397,33 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                ) == LoopAction::Exit
-                {
+                );
+                if drain_action == LoopAction::Exit {
+                    tracing::warn!(
+                        pending_promotions = panicked_evaluations.len(),
+                        "no runtime remains after evaluation panic; leaving accepted jobs open for restart recovery"
+                    );
                     break;
+                }
+                for evaluation in panicked_evaluations {
+                    if let Some(evaluation) =
+                        take_pending_job_promotion(&mut pending_job_promotions, Some(evaluation))
+                    {
+                        tracing::info!(
+                            job_id = %evaluation.job_id,
+                            channel_id = %evaluation.channel_id,
+                            channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                            "panicked evaluation released; promoting accepted job"
+                        );
+                        promote_accepted_job(
+                            &ctx.rest_client,
+                            &mut queue,
+                            &mut queued_job_attempts,
+                            &evaluation,
+                            config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                        )
+                        .await;
+                    }
                 }
                 for (channel_id, thread_tags) in
                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
@@ -3328,7 +3457,7 @@ async fn tokio_main() -> Result<()> {
                     }
                 }
                 tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                let panicked_evaluation = recover_panicked_agent(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3342,8 +3471,29 @@ async fn tokio_main() -> Result<()> {
                     observer.clone(),
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
-                    tracing::error!("all agents dead — exiting");
+                    tracing::warn!(
+                        has_pending_promotion = panicked_evaluation.is_some(),
+                        "no runtime remains after evaluation panic; exiting before claim so restart recovery can proceed"
+                    );
                     break;
+                }
+                if let Some(evaluation) =
+                    take_pending_job_promotion(&mut pending_job_promotions, panicked_evaluation)
+                {
+                    tracing::info!(
+                        job_id = %evaluation.job_id,
+                        channel_id = %evaluation.channel_id,
+                        channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+                        "panicked evaluation released; promoting accepted job"
+                    );
+                    promote_accepted_job(
+                        &ctx.rest_client,
+                        &mut queue,
+                        &mut queued_job_attempts,
+                        &evaluation,
+                        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                    )
+                    .await;
                 }
                 for (channel_id, thread_tags) in
                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
@@ -3833,6 +3983,26 @@ fn signal_in_flight_task(
     false
 }
 
+/// Stop exactly the proposal turn that produced a durable accept/reject event.
+/// Ordinary work in the same channel is deliberately unaffected.
+fn signal_job_evaluation_boundary(
+    pool: &mut AgentPool,
+    evaluation: &job_execution::JobEvaluationContext,
+) -> bool {
+    let entry = pool
+        .task_map_mut()
+        .values_mut()
+        .find(|meta| meta.job_evaluation.as_ref() == Some(evaluation));
+    if let Some(meta) = entry {
+        if let Some(tx) = meta.control_tx.take() {
+            meta.job_evaluation_decided = true;
+            let _ = tx.send(ControlSignal::Rotate);
+            return true;
+        }
+    }
+    false
+}
+
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
 ///
 /// Caller invariants:
@@ -3942,6 +4112,80 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+async fn promote_accepted_job(
+    rest: &relay::RestClient,
+    queue: &mut EventQueue,
+    queued_attempts: &mut HashSet<Uuid>,
+    evaluation: &job_execution::JobEvaluationContext,
+    lease_seconds: u64,
+) {
+    debug_assert!(!queue.is_channel_in_flight(evaluation.channel_id));
+    const MAX_VISIBILITY_PASSES: usize = 5;
+    for pass in 1..=MAX_VISIBILITY_PASSES {
+        tracing::debug!(
+            job_id = %evaluation.job_id,
+            request_event_id = %evaluation.request_event_id,
+            channel_id = %evaluation.channel_id,
+            pass,
+            channel_in_flight = queue.is_channel_in_flight(evaluation.channel_id),
+            "invoking exact post-evaluation delegated-job reconciliation"
+        );
+        match job_execution::reconcile_job(rest, queued_attempts, lease_seconds, evaluation).await {
+            Ok(result) if !result.work.is_empty() => {
+                let count = result.work.len();
+                enqueue_job_continuations(queue, queued_attempts, result.work);
+                tracing::info!(
+                    job_id = %evaluation.job_id,
+                    channel_id = %evaluation.channel_id,
+                    continuations = count,
+                    "claimed delegated-job continuation queued after evaluation release"
+                );
+                return;
+            }
+            Ok(result) => {
+                let retry_visibility = matches!(
+                    result.state,
+                    None | Some(buzz_core::delegated_job::JobState::Requested)
+                );
+                tracing::debug!(
+                    job_id = %evaluation.job_id,
+                    pass,
+                    queried_events = result.queried_events,
+                    attempts = result.attempts,
+                    projected_state = ?result.state,
+                    retry_visibility,
+                    "post-evaluation reconciliation produced no new continuation"
+                );
+                if !retry_visibility {
+                    return;
+                }
+            }
+            Err(error) => tracing::warn!(
+                job_id = %evaluation.job_id,
+                pass,
+                "post-evaluation delegated-job reconciliation failed and remains retryable: {error}"
+            ),
+        }
+        if pass < MAX_VISIBILITY_PASSES {
+            let delay_ms = 50_u64 << (pass - 1);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+    tracing::warn!(
+        job_id = %evaluation.job_id,
+        request_event_id = %evaluation.request_event_id,
+        "accepted job was not promotable within the bounded decision handoff; periodic recovery remains authoritative"
+    );
+}
+
+fn take_pending_job_promotion(
+    pending: &mut HashMap<Uuid, job_execution::JobEvaluationContext>,
+    evaluation: Option<job_execution::JobEvaluationContext>,
+) -> Option<job_execution::JobEvaluationContext> {
+    let evaluation = evaluation?;
+    pending.remove(&evaluation.job_id).map(|_| evaluation)
+}
+
 /// Flush queued work to available agents.
 fn enqueue_job_continuations(
     queue: &mut EventQueue,
@@ -3969,6 +4213,12 @@ fn enqueue_job_continuations(
             },
         });
         queued_attempts.insert(attempt_id);
+        tracing::info!(
+            %attempt_id,
+            %channel_id,
+            queued_attempts = queued_attempts.len(),
+            "durably claimed delegated-job continuation enqueued"
+        );
     }
 }
 
@@ -3985,6 +4235,20 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        if let Some(execution) = batch
+            .events
+            .iter()
+            .find_map(|event| job_execution::from_prompt_tag(&event.prompt_tag))
+        {
+            tracing::info!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                generation = execution.generation,
+                claim_event_id = %execution.claim_event_id,
+                %channel_id,
+                "dispatching claimed delegated-job continuation"
+            );
+        }
         if batch.events.iter().any(|event| {
             job_execution::from_prompt_tag(&event.prompt_tag)
                 .is_some_and(|execution| execution.lease_until <= chrono::Utc::now().timestamp())
@@ -4040,6 +4304,10 @@ fn dispatch_pending(
             .events
             .iter()
             .find_map(|event| job_execution::from_prompt_tag(&event.prompt_tag));
+        let job_evaluation = batch
+            .events
+            .iter()
+            .find_map(|event| job_execution::evaluation_context(&event.event));
         let turn_id = job_execution
             .as_ref()
             .map(|execution| execution.turn_id.clone())
@@ -4066,6 +4334,8 @@ fn dispatch_pending(
                 channel_id: Some(channel_id),
                 turn_id,
                 job_execution,
+                job_evaluation,
+                job_evaluation_decided: false,
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
@@ -4162,6 +4432,16 @@ fn handle_prompt_result(
         .values()
         .find(|meta| meta.agent_index == agent_index)
         .and_then(|meta| meta.job_execution.clone());
+    let job_evaluation = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .and_then(|meta| meta.job_evaluation.clone());
+    let job_evaluation_decided = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .is_some_and(|meta| meta.job_evaluation_decided);
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -4206,6 +4486,14 @@ fn handle_prompt_result(
             tracing::info!(
                 channel_id = %batch.channel_id,
                 "job attempt ended; durable reconciliation owns continuation"
+            );
+        } else if should_drop_decided_job_evaluation(
+            job_evaluation.is_some(),
+            job_evaluation_decided,
+        ) {
+            tracing::info!(
+                channel_id = %batch.channel_id,
+                "job evaluation ended at its durable decision boundary; dropping proposal batch"
             );
         } else if !removed_channels.contains(&batch.channel_id) {
             if matches!(
@@ -4559,6 +4847,16 @@ fn handle_prompt_result(
     LoopAction::Continue
 }
 
+/// A proposal turn carrying durable evaluation metadata is consumed by its
+/// accept/reject decision. It must never enter ordinary cancel-and-merge
+/// requeue handling.
+fn should_drop_decided_job_evaluation(
+    has_evaluation_context: bool,
+    matching_decision_observed: bool,
+) -> bool {
+    has_evaluation_context && matching_decision_observed
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recover_panicked_agent(
     pool: &mut AgentPool,
@@ -4572,17 +4870,28 @@ fn recover_panicked_agent(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) {
+) -> Option<job_execution::JobEvaluationContext> {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
         tracing::error!("panic for unknown task {task_id:?} — bug");
-        return;
+        return None;
     };
     let i = meta.agent_index;
+    let job_evaluation = meta.job_evaluation.clone();
+    let decided_job_evaluation = should_drop_decided_job_evaluation(
+        meta.job_evaluation.is_some(),
+        meta.job_evaluation_decided,
+    );
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
-        if let Some(ch) = meta.channel_id {
+        if decided_job_evaluation {
+            tracing::info!(
+                agent = i,
+                job_id = ?job_evaluation.as_ref().map(|evaluation| evaluation.job_id),
+                "consuming decided delegated-job evaluation after panic"
+            );
+        } else if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
@@ -4626,7 +4935,7 @@ fn recover_panicked_agent(
     let delay = match slot.record_crash() {
         CrashVerdict::CircuitOpen => {
             tracing::error!(agent = i, "circuit open after panic — not respawning");
-            return;
+            return job_evaluation;
         }
         CrashVerdict::HalfOpenProbe => {
             tracing::info!(agent = i, "circuit half-open — probe respawn after panic");
@@ -4656,6 +4965,7 @@ fn recover_panicked_agent(
         let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
+    job_evaluation
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4670,11 +4980,12 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
-) -> LoopAction {
+) -> (LoopAction, Vec<job_execution::JobEvaluationContext>) {
+    let mut panicked_evaluations = Vec::new();
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            if let Some(evaluation) = recover_panicked_agent(
                 pool,
                 queue,
                 config,
@@ -4686,13 +4997,15 @@ fn drain_ready_join_results(
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
-            );
+            ) {
+                panicked_evaluations.push(evaluation);
+            }
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                return LoopAction::Exit;
+                return (LoopAction::Exit, panicked_evaluations);
             }
         }
     }
-    LoopAction::Continue
+    (LoopAction::Continue, panicked_evaluations)
 }
 
 fn dispatch_heartbeat(
@@ -4738,6 +5051,9 @@ fn dispatch_heartbeat(
             channel_id: None,
             turn_id,
             job_execution: None,
+            job_evaluation: None,
+
+            job_evaluation_decided: false,
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5227,7 +5543,9 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     // so shutdown() runs on all paths (success, error, timeout).
     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
         let init = client.initialize().await?;
-        let session = client.session_new_full(&cwd, vec![], None, None).await?;
+        let session = client
+            .session_new_full(&cwd, vec![], None, None, None)
+            .await?;
         Ok::<_, acp::AcpError>((init, session))
     })
     .await;
@@ -5538,6 +5856,9 @@ mod owner_control_command_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -5561,6 +5882,49 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+
+    #[tokio::test]
+    async fn job_decision_cancels_only_the_matching_evaluation_turn() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let evaluation = job_execution::JobEvaluationContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "ab".repeat(32),
+            channel_id,
+        };
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "evaluation-turn".into(),
+                job_execution: None,
+                job_evaluation: Some(evaluation.clone()),
+
+                job_evaluation_decided: false,
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let mut wrong = evaluation.clone();
+        wrong.job_id = Uuid::new_v4();
+        assert!(!signal_job_evaluation_boundary(&mut pool, &wrong));
+        assert!(signal_job_evaluation_boundary(&mut pool, &evaluation));
+        assert_eq!(control_rx.await.unwrap(), ControlSignal::Rotate);
+        assert!(!signal_job_evaluation_boundary(&mut pool, &evaluation));
+    }
+
+    #[test]
+    fn decided_job_evaluation_is_dropped_instead_of_requeued() {
+        assert!(should_drop_decided_job_evaluation(true, true));
+        assert!(!should_drop_decided_job_evaluation(true, false));
+        assert!(!should_drop_decided_job_evaluation(false, true));
     }
 
     #[test]
@@ -7665,6 +8029,9 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7738,6 +8105,9 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7854,6 +8224,9 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7920,6 +8293,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7998,6 +8374,9 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 turn_id: "panic-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8022,7 +8401,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
 
-        recover_panicked_agent(
+        let recovered_evaluation = recover_panicked_agent(
             &mut pool,
             &mut queue,
             &config,
@@ -8035,6 +8414,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
         );
+        assert!(recovered_evaluation.is_none());
 
         let panic = observer
             .snapshot()
@@ -8046,6 +8426,92 @@ mod error_outcome_emission_tests {
             Some(channel_id.to_string().as_str())
         );
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+    }
+
+    #[tokio::test]
+    async fn accepted_evaluation_panic_releases_channel_and_returns_pending_promotion() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let evaluation = job_execution::JobEvaluationContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "request-event-id".to_string(),
+            channel_id,
+        };
+        let request = EventBuilder::new(Kind::Custom(43001), "proposal")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event: request,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "job-evaluation".to_string(),
+        }));
+        let evaluation_batch = queue.flush_next().expect("evaluation dispatches");
+        assert!(queue.is_channel_in_flight(channel_id));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let task_id = abort_handle.id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "accepted-panic-turn".to_string(),
+                job_execution: None,
+                job_evaluation: Some(evaluation.clone()),
+                job_evaluation_decided: true,
+                recoverable_batch: Some(evaluation_batch),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let mut pending = HashMap::from([(evaluation.job_id, evaluation.clone())]);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        let recovered_evaluation = recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+        );
+
+        assert!(!queue.is_channel_in_flight(channel_id));
+        assert!(
+            queue.flush_next().is_none(),
+            "a decided evaluation proposal must not be requeued after panic"
+        );
+        assert_eq!(
+            take_pending_job_promotion(&mut pending, recovered_evaluation),
+            Some(evaluation)
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
@@ -8092,6 +8558,9 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
+                    job_evaluation: None,
+
+                    job_evaluation_decided: false,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8185,6 +8654,9 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
+                    job_evaluation: None,
+
+                    job_evaluation_decided: false,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8292,6 +8764,9 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
                     job_execution: None,
+                    job_evaluation: None,
+
+                    job_evaluation_decided: false,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8370,6 +8845,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8466,6 +8944,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8584,6 +9065,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8725,6 +9209,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8915,6 +9402,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9002,6 +9492,9 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 job_execution: None,
+                job_evaluation: None,
+
+                job_evaluation_decided: false,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,

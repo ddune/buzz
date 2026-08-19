@@ -1652,7 +1652,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         .all(|event| event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST)
     {
         let mut orientation = String::from(
-            "[Delegated job request]\nThis is a proposed delegation, not accepted work. Inspect the assignment and structurally accept or reject it; conversational prose is not authoritative.",
+            "[Delegated job request]\nThis is a proposed delegation, not accepted work. Inspect the assignment and structurally accept or reject it; conversational prose is not authoritative. Acceptance or rejection ends this evaluation turn immediately. Do not begin implementation in this turn: accepted work resumes in a separate continuation only after Buzz has durably created and claimed its first execution generation.",
         );
         for event in &batch.events {
             if let Ok(job) = buzz_core::delegated_job::parse_job_request(&event.event) {
@@ -2106,6 +2106,34 @@ mod tests {
                 .prompt_tag
         )
         .is_some());
+    }
+
+    #[test]
+    fn accepted_evaluation_release_makes_claimed_continuation_dispatchable() {
+        let channel = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(make_job_queued(channel, "evaluate this proposal")));
+        let evaluation = queue.flush_next().expect("evaluation batch");
+        assert!(queue.is_channel_in_flight(channel));
+
+        queue.push_durable_continuation(make_continuation_queued(
+            channel,
+            "accepted generation one",
+            1,
+        ));
+        assert!(
+            queue.flush_next().is_none(),
+            "claim cannot overlap evaluation"
+        );
+
+        queue.mark_complete(evaluation.channel_id);
+        assert!(!queue.is_channel_in_flight(channel));
+        let continuation = queue.flush_next().expect("generation one dispatchable");
+        assert_eq!(continuation.events.len(), 1);
+        let execution = crate::job_execution::from_prompt_tag(&continuation.events[0].prompt_tag)
+            .expect("claimed continuation");
+        assert_eq!(execution.generation, 1);
+        assert!(!execution.claim_event_id.is_empty());
     }
 
     #[test]

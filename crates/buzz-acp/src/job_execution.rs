@@ -34,6 +34,24 @@ pub struct JobExecutionContext {
     pub lease_until: i64,
 }
 
+/// Identity of a proposed delegated job whose accept/reject decision is being
+/// made by an ordinary ACP turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobEvaluationContext {
+    pub job_id: Uuid,
+    pub request_event_id: String,
+    pub channel_id: Uuid,
+}
+
+pub fn evaluation_context(event: &Event) -> Option<JobEvaluationContext> {
+    let request = parse_job_request(event).ok()?;
+    Some(JobEvaluationContext {
+        job_id: request.job_id,
+        request_event_id: request.request_event_id,
+        channel_id: request.channel_id,
+    })
+}
+
 const PROMPT_TAG_PREFIX: &str = "delegated-job-continuation:";
 
 /// Encode attempt metadata into the harness-internal queue tag.
@@ -56,6 +74,15 @@ pub struct ContinuationWork {
     pub request: Event,
     /// Attempt metadata subordinate to that request.
     pub execution: JobExecutionContext,
+}
+
+/// Observable result of an exact-job reconciliation pass.
+#[derive(Debug)]
+pub struct JobReconcileResult {
+    pub work: Vec<ContinuationWork>,
+    pub state: Option<JobState>,
+    pub queried_events: usize,
+    pub attempts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -125,19 +152,89 @@ pub async fn reconcile(
     already_queued: &HashSet<Uuid>,
     lease_seconds: u64,
 ) -> Result<Vec<ContinuationWork>, RelayError> {
+    let events = query_events(rest, None).await?;
+    reconcile_events(rest, already_queued, lease_seconds, events).await
+}
+
+/// Reconcile one accepted job through the same canonical state machine used by
+/// broad startup/periodic recovery. Exact `#d` filters keep the decision-driven
+/// path independent of unrelated portfolio volume and pagination.
+pub async fn reconcile_job(
+    rest: &RestClient,
+    already_queued: &HashSet<Uuid>,
+    lease_seconds: u64,
+    evaluation: &JobEvaluationContext,
+) -> Result<JobReconcileResult, RelayError> {
+    let events = query_events(rest, Some(evaluation.job_id)).await?;
+    let queried_events = events.len();
+    let attempts = events
+        .iter()
+        .filter(|event| parse_execution_attempt(event).is_ok())
+        .count();
+    let projection = project_jobs(&events).remove(&evaluation.job_id);
+    let state = projection.as_ref().and_then(|job| {
+        let request = parse_job_request(&job.request).ok()?;
+        (request.request_event_id == evaluation.request_event_id
+            && request.channel_id == evaluation.channel_id)
+            .then_some(job.state)
+    });
+    tracing::debug!(
+        job_id = %evaluation.job_id,
+        request_event_id = %evaluation.request_event_id,
+        channel_id = %evaluation.channel_id,
+        queried_events,
+        attempts,
+        projected_state = ?state,
+        "exact delegated-job reconciliation snapshot"
+    );
+    let work = if state.is_some() {
+        reconcile_events(rest, already_queued, lease_seconds, events).await?
+    } else {
+        Vec::new()
+    };
+    Ok(JobReconcileResult {
+        work,
+        state,
+        queried_events,
+        attempts,
+    })
+}
+
+async fn query_events(rest: &RestClient, job_id: Option<Uuid>) -> Result<Vec<Event>, RelayError> {
     let pubkey = rest.keys.public_key().to_hex();
-    let filters: Vec<Filter> = serde_json::from_value(serde_json::json!([
-        {"kinds":[KIND_JOB_REQUEST], "#p":[pubkey]},
-        {"kinds":[KIND_JOB_ACCEPTED,KIND_JOB_REJECTED,KIND_JOB_COMPLETED,KIND_JOB_BLOCKED,KIND_JOB_DELEGATED], "authors":[pubkey]},
-        {"kinds":[KIND_JOB_EXECUTION_ATTEMPT], "authors":[pubkey]}
-    ]))
-    .map_err(RelayError::Json)?;
+    let filters = reconcile_filters(&pubkey, job_id)?;
     let mut events = Vec::new();
     for filter in &filters {
         events.extend(rest.query_all(filter).await?);
     }
     events.sort_by_key(|event| (event.created_at, event.id));
+    Ok(events)
+}
 
+fn reconcile_filters(pubkey: &str, job_id: Option<Uuid>) -> Result<Vec<Filter>, RelayError> {
+    let raw_filters = if let Some(job_id) = job_id {
+        let coordinate = [job_id.to_string()];
+        serde_json::json!([
+            {"kinds":[KIND_JOB_REQUEST], "#p":[pubkey], "#d":coordinate},
+            {"kinds":[KIND_JOB_ACCEPTED,KIND_JOB_REJECTED,KIND_JOB_COMPLETED,KIND_JOB_BLOCKED,KIND_JOB_DELEGATED], "authors":[pubkey], "#d":coordinate},
+            {"kinds":[KIND_JOB_EXECUTION_ATTEMPT], "authors":[pubkey], "#d":coordinate}
+        ])
+    } else {
+        serde_json::json!([
+            {"kinds":[KIND_JOB_REQUEST], "#p":[pubkey]},
+            {"kinds":[KIND_JOB_ACCEPTED,KIND_JOB_REJECTED,KIND_JOB_COMPLETED,KIND_JOB_BLOCKED,KIND_JOB_DELEGATED], "authors":[pubkey]},
+            {"kinds":[KIND_JOB_EXECUTION_ATTEMPT], "authors":[pubkey]}
+        ])
+    };
+    serde_json::from_value(raw_filters).map_err(RelayError::Json)
+}
+
+async fn reconcile_events(
+    rest: &RestClient,
+    already_queued: &HashSet<Uuid>,
+    lease_seconds: u64,
+    events: Vec<Event>,
+) -> Result<Vec<ContinuationWork>, RelayError> {
     let jobs = project_jobs(&events);
 
     let mut attempts: HashMap<
@@ -169,6 +266,13 @@ pub async fn reconcile(
                 let attempt_id = Uuid::new_v4();
                 let event = build_runnable(rest, &request, attempt_id, generation)?;
                 require_accepted(rest.submit_event(&event).await?)?;
+                tracing::info!(
+                    job_id = %job_id,
+                    attempt_id = %attempt_id,
+                    generation,
+                    runnable_event_id = %event.id,
+                    "delegated-job runnable persisted"
+                );
                 let parsed = parse_execution_attempt(&event)
                     .map_err(|error| RelayError::Http(error.to_string()))?;
                 (event, parsed)
@@ -200,6 +304,16 @@ pub async fn reconcile(
             lease_until,
         )
         .await?;
+        tracing::info!(
+            job_id = %job_id,
+            attempt_id = %runnable.attempt_id,
+            generation = runnable.generation,
+            runnable_event_id = %runnable_event.id,
+            claim_event_id = %claim_event.id,
+            turn_id = %turn_id,
+            lease_until,
+            "delegated-job generation claimed before enqueue"
+        );
         work.push(ContinuationWork {
             request: job.request,
             execution: JobExecutionContext {
@@ -456,6 +570,54 @@ mod tests {
         ] {
             assert_ne!(state, JobState::Accepted);
         }
+    }
+
+    #[test]
+    fn exact_reconciliation_filters_bind_every_query_to_one_job() {
+        let job_id = Uuid::new_v4();
+        let filters = reconcile_filters(&"ab".repeat(32), Some(job_id)).expect("filters");
+        assert_eq!(filters.len(), 3);
+        for filter in filters {
+            let value = serde_json::to_value(filter).expect("serialize");
+            assert_eq!(
+                value.get("#d"),
+                Some(&serde_json::json!([job_id.to_string()]))
+            );
+        }
+
+        let broad = reconcile_filters(&"ab".repeat(32), None).expect("filters");
+        assert!(broad.into_iter().all(|filter| {
+            serde_json::to_value(filter)
+                .expect("serialize")
+                .get("#d")
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn evaluation_context_is_bound_to_the_immutable_request_coordinates() {
+        let requester = Keys::generate();
+        let target = Keys::generate();
+        let job_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let request = EventBuilder::new(Kind::Custom(KIND_JOB_REQUEST as u16), "assignment")
+            .tags([
+                Tag::parse(["d", &job_id.to_string()]).expect("tag"),
+                Tag::parse(["job-target", &target.public_key().to_hex()]).expect("tag"),
+                Tag::parse(["p", &target.public_key().to_hex()]).expect("tag"),
+                Tag::parse(["h", &channel_id.to_string()]).expect("tag"),
+            ])
+            .sign_with_keys(&requester)
+            .expect("request");
+
+        assert_eq!(
+            evaluation_context(&request),
+            Some(JobEvaluationContext {
+                job_id,
+                request_event_id: request.id.to_hex(),
+                channel_id,
+            })
+        );
     }
 
     #[test]

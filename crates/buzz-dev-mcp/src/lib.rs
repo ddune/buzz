@@ -46,6 +46,11 @@ impl DevMcp {
         Parameters(p): Parameters<shell::ShellParams>,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if evaluation_only() && !evaluation_shell_command_allowed(&p.command) {
+            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
+                "Delegated-job evaluation permits only `buzz jobs accept` or `buzz jobs reject`; executable repository work begins in the claimed continuation.",
+            )]));
+        }
         shell::run(&self.state, p, context.ct).await
     }
 
@@ -79,6 +84,12 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<str_replace::StrReplaceParams>,
     ) -> Result<String, ErrorData> {
+        if evaluation_only() {
+            return Err(ErrorData::invalid_request(
+                "file mutation is disabled during delegated-job evaluation",
+                None,
+            ));
+        }
         str_replace::run(&self.state, p)
     }
 
@@ -121,6 +132,23 @@ impl DevMcp {
     ) -> Result<CallToolResult, ErrorData> {
         todo::text_result(self.todos.post_compact())
     }
+}
+
+fn evaluation_only() -> bool {
+    std::env::var_os("BUZZ_JOB_EVALUATION_ONLY").is_some()
+}
+
+fn evaluation_shell_command_allowed(command: &str) -> bool {
+    if command
+        .chars()
+        .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r'))
+    {
+        return false;
+    }
+    let mut words = command.split_whitespace();
+    words.next() == Some("buzz")
+        && words.next() == Some("jobs")
+        && matches!(words.next(), Some("accept" | "reject"))
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -210,4 +238,36 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod evaluation_tests {
+    use super::evaluation_shell_command_allowed;
+
+    #[test]
+    fn evaluation_shell_allows_only_constrained_job_decisions() {
+        assert!(evaluation_shell_command_allowed(
+            "buzz jobs accept --job 00000000-0000-0000-0000-000000000000 --request aa --channel 00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(evaluation_shell_command_allowed(
+            "buzz jobs reject --job id --request event --channel channel --content 'out of scope'"
+        ));
+        for command in [
+            "git status",
+            "bash -lc 'touch marker'",
+            "python -c 'open(\"marker\", \"w\").close()'",
+            "buzz jobs complete --job id",
+            "buzz jobs blocked --job id",
+            "buzz jobs delegate --job id",
+            "buzz jobs accept --job id; touch marker",
+            "buzz jobs accept --job id && cargo test",
+            "buzz jobs accept --content $(touch marker)",
+            "buzz jobs reject --content `touch marker`",
+        ] {
+            assert!(
+                !evaluation_shell_command_allowed(command),
+                "unexpected evaluation command admission: {command}"
+            );
+        }
+    }
 }

@@ -625,7 +625,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 34);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -650,6 +650,18 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE delegated_jobs"));
+        assert_eq!(migrations[32].version, 33);
+        assert!(migrations[32]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE job_execution_attempts"));
+        assert_eq!(migrations[33].version, 34);
+        let job_mentions = migrations[33].sql.as_str();
+        assert!(job_mentions.contains("INSERT INTO event_mentions"));
+        assert!(job_mentions.contains("c.deletion_state = 'active'"));
+        assert!(job_mentions.contains("e.kind = 43001"));
+        assert!(job_mentions.contains("jsonb_array_elements(e.tags)"));
+        assert!(job_mentions.contains("ON CONFLICT DO NOTHING"));
         assert!(migrations[0]
             .sql
             .as_str()
