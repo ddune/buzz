@@ -1490,6 +1490,9 @@ mod tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
+        // Added after the 0029 deletion foundation; migration 0032 attaches
+        // the same mandatory fence when delegated_jobs is introduced.
+        expected_fences.insert("delegated_jobs".to_string());
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

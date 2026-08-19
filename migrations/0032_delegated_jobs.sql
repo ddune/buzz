@@ -30,3 +30,5 @@ CREATE TABLE delegated_jobs (
 
 CREATE INDEX idx_delegated_jobs_target_state
     ON delegated_jobs (community_id, target_agent, state, created_at DESC);
+
+SELECT attach_community_write_fence('delegated_jobs');
