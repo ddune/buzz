@@ -105,7 +105,7 @@ async fn get(client: &BuzzClient, job: &str) -> Result<(), CliError> {
     let filter = serde_json::json!({
         "kinds": [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED,
                   KIND_JOB_COMPLETED, KIND_JOB_BLOCKED, KIND_JOB_DELEGATED],
-        "#job": [job_id.to_string()],
+        "#d": [job_id.to_string()],
         "limit": 16
     });
     println!("{}", client.query(&filter).await?);
@@ -136,7 +136,7 @@ async fn list_accepted(client: &BuzzClient, target: &str) -> Result<(), CliError
     let lifecycle_filter = serde_json::json!({
         "kinds": [KIND_JOB_ACCEPTED, KIND_JOB_REJECTED, KIND_JOB_COMPLETED,
                   KIND_JOB_BLOCKED, KIND_JOB_DELEGATED],
-        "#job": ids,
+        "#d": ids,
     });
     let mut events: Vec<nostr::Event> = client
         .query_all(lifecycle_filter)
@@ -179,8 +179,8 @@ async fn list_accepted(client: &BuzzClient, target: &str) -> Result<(), CliError
         }
     }
     let mut accepted: Vec<serde_json::Value> = jobs
-        .into_values()
-        .filter_map(|(request, state)| {
+        .into_iter()
+        .filter_map(|(job_id, (request, state))| {
             (state == buzz_core::delegated_job::JobState::Accepted).then(|| {
                 serde_json::json!({
                     "job_id": request.job_id,
@@ -190,6 +190,8 @@ async fn list_accepted(client: &BuzzClient, target: &str) -> Result<(), CliError
                     "target": request.target_agent,
                     "assignment": request.assignment,
                     "state": state.as_str(),
+                    "acceptance_event_id": heads.get(&job_id),
+                    "parent": heads.get(&job_id),
                 })
             })
         })
@@ -209,7 +211,7 @@ fn job_tags(
     extra: Option<(&str, &str)>,
 ) -> Result<Vec<Tag>, CliError> {
     let mut tags = vec![
-        parse_tag(["job", &job_id.to_string()])?,
+        parse_tag(["d", &job_id.to_string()])?,
         parse_tag(["h", &channel.to_string()])?,
     ];
     if let Some((name, value)) = extra {
@@ -232,7 +234,7 @@ mod tests {
         let mut tags =
             job_tags(Uuid::nil(), Uuid::nil(), Some(("job-target", &target))).expect("tags");
         tags.push(parse_tag(["p", &target]).expect("routing tag"));
-        for name in ["job", "h", "job-target", "p"] {
+        for name in ["d", "h", "job-target", "p"] {
             assert_eq!(
                 tags.iter().filter(|tag| tag.as_slice()[0] == name).count(),
                 1

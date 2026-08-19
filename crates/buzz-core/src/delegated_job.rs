@@ -178,9 +178,9 @@ pub fn parse_job_request(event: &Event) -> Result<JobRequest, JobProtocolError> 
         return Err(JobProtocolError::WrongKind);
     }
     validate_content(&event.content, true)?;
-    let job_id = exactly_one_tag(event, "job")?
+    let job_id = exactly_one_tag(event, "d")?
         .parse::<Uuid>()
-        .map_err(|_| JobProtocolError::InvalidEnvelope("job must be a UUID".into()))?;
+        .map_err(|_| JobProtocolError::InvalidEnvelope("d must be a job UUID".into()))?;
     let target_agent = validate_pubkey(exactly_one_tag(event, "job-target")?, "job-target")?;
     let routed_target = validate_pubkey(exactly_one_tag(event, "p")?, "p")?;
     if routed_target != target_agent {
@@ -206,9 +206,9 @@ pub fn parse_job_request(event: &Event) -> Result<JobRequest, JobProtocolError> 
 pub fn parse_job_lifecycle(event: &Event) -> Result<JobLifecycleEvent, JobProtocolError> {
     let action = JobAction::from_kind(event_kind_u32(event)).ok_or(JobProtocolError::WrongKind)?;
     validate_content(&event.content, false)?;
-    let job_id = exactly_one_tag(event, "job")?
+    let job_id = exactly_one_tag(event, "d")?
         .parse::<Uuid>()
-        .map_err(|_| JobProtocolError::InvalidEnvelope("job must be a UUID".into()))?;
+        .map_err(|_| JobProtocolError::InvalidEnvelope("d must be a job UUID".into()))?;
     let request_event_id =
         validate_event_id(exactly_one_tag(event, "job-request")?, "job-request")?;
     let parent_event_id = validate_event_id(exactly_one_tag(event, "job-parent")?, "job-parent")?;
@@ -335,7 +335,7 @@ mod tests {
 
     fn base_tags(target: &str) -> Vec<Tag> {
         vec![
-            Tag::parse(["job", &Uuid::nil().to_string()]).expect("tag"),
+            Tag::parse(["d", &Uuid::nil().to_string()]).expect("tag"),
             Tag::parse(["job-target", target]).expect("tag"),
             Tag::parse(["p", target]).expect("tag"),
             Tag::parse(["h", &Uuid::nil().to_string()]).expect("tag"),
@@ -353,7 +353,7 @@ mod tests {
         many.push(Tag::parse(["job-target", &"cd".repeat(32)]).expect("tag"));
         assert!(parse_job_request(&request(many)).is_err());
         let mut bad_id = base_tags(&target);
-        bad_id[0] = Tag::parse(["job", "not-a-uuid"]).expect("tag");
+        bad_id[0] = Tag::parse(["d", "not-a-uuid"]).expect("tag");
         assert!(parse_job_request(&request(bad_id)).is_err());
     }
 
@@ -389,7 +389,7 @@ mod tests {
 
     fn lifecycle_tags() -> Vec<Tag> {
         vec![
-            Tag::parse(["job", &Uuid::nil().to_string()]).expect("tag"),
+            Tag::parse(["d", &Uuid::nil().to_string()]).expect("tag"),
             Tag::parse(["job-request", &"ab".repeat(32)]).expect("tag"),
             Tag::parse(["job-parent", &"ab".repeat(32)]).expect("tag"),
             Tag::parse(["h", &Uuid::nil().to_string()]).expect("tag"),

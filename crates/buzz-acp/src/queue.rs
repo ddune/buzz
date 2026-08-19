@@ -1846,7 +1846,7 @@ mod tests {
                 content,
             )
             .tags([
-                nostr::Tag::parse(["job", &Uuid::new_v4().to_string()]).unwrap(),
+                nostr::Tag::parse(["d", &Uuid::new_v4().to_string()]).unwrap(),
                 nostr::Tag::parse(["job-target", &target]).unwrap(),
                 nostr::Tag::parse(["p", &target]).unwrap(),
                 nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),

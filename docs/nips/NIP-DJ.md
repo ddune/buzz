@@ -27,7 +27,7 @@ All events are regular append-only stored events. The relay materializes the cur
 
 Required public tags, each exactly once and with exactly two elements:
 
-- `job`: canonical UUID identifying the job;
+- `d`: canonical UUID identifying the job and enabling standard `#d` queries;
 - `job-target`: 64-character hex pubkey of exactly one managed agent;
 - `p`: exactly one copy of that same target pubkey for Nostr subscription routing;
 - `h`: UUID of the originating Buzz channel.
@@ -46,7 +46,7 @@ This policy can later be extended through an explicit delegated-authority contra
 
 Required tags, each exactly once:
 
-- `job`: the original job UUID;
+- `d`: the original job UUID;
 - `job-request`: the original `43001` event ID;
 - `job-parent`: the immediate predecessor event ID;
 - `h`: the immutable originating channel UUID.
@@ -81,7 +81,7 @@ The request event ID, requester, target, channel, assignment hash, and job UUID 
 
 ## Query and recovery
 
-The signed history is queryable by kinds and `#job`. The materialized state records request, acceptance, terminal event, target, context, successor, and current state. It supports:
+The signed history is queryable by kinds and the standard single-letter `#d` filter. The materialized state records request, acceptance, terminal event, target, context, successor, and current state. It supports:
 
 - all jobs targeting an agent;
 - accepted non-terminal jobs targeting an agent;
@@ -94,6 +94,6 @@ Because both history and current state are durable, a relay or ACP restart recon
 
 ## Agent ingestion
 
-`buzz-acp` subscribes to `43001` separately from conversational messages, validates that `job-target` is its own identity, and places job requests only in job-class runtime batches. It presents explicit `buzz jobs accept` and `buzz jobs reject` commands. Lifecycle events are control-plane state and never enter conversational dispatch.
+`buzz-acp` includes targeted `43001` delivery as an invariant control-plane subscription for every discovered member channel, independent of conversational kind overrides and config rules. It validates that `job-target` is its own identity and places requests only in job-class runtime batches. It presents explicit `buzz jobs accept` and `buzz jobs reject` commands. Lifecycle events are control-plane state and never enter conversational dispatch.
 
 Receipt, a human-facing pickup message, or a normal ACP turn does not accept a job. Only a valid target-authored `43002` event does.

@@ -1363,18 +1363,29 @@ pub fn resolve_channel_filters(
         }
     }
 
+    // Delegated-job ingress is an invariant control-plane subscription, not a
+    // conversational rule. Every channel where this agent is a discovered
+    // member must admit targeted 43001 events even when kind overrides or
+    // config-mode rules omit ordinary conversational traffic.
+    for channel_id in discovered_channels {
+        let filter = result.entry(*channel_id).or_insert_with(|| ChannelFilter {
+            kinds: Some(Vec::new()),
+            require_mention: true,
+        });
+        if let Some(kinds) = &mut filter.kinds {
+            if !kinds.contains(&KIND_JOB_REQUEST) {
+                kinds.push(KIND_JOB_REQUEST);
+            }
+        }
+    }
+
     result
 }
 
 /// Resolve the subscription filter for a single dynamically-discovered channel.
 ///
-/// In Mentions/All mode, `channels_override` (--channels) is enforced — the agent
-/// won't subscribe to channels outside the operator's allowlist. In Config mode,
-/// `--channels` is ignored (per CLI contract) and rule-matching determines scope.
-///
-/// Returns `None` when the channel is outside the agent's configured scope:
-/// - Mentions/All: channel not in `channels_override` (if set)
-/// - Config: no subscription rules match the channel
+/// Conversational traffic honors channel overrides and config rules. Targeted
+/// delegated-job requests remain subscribed as invariant control-plane input.
 pub fn resolve_dynamic_channel_filter(
     config: &Config,
     channel_id: Uuid,
@@ -1395,7 +1406,10 @@ pub fn resolve_dynamic_channel_filter(
                 .iter()
                 .any(|s| s.parse::<Uuid>().ok() == Some(channel_id));
             if !allowed {
-                return None;
+                return Some(ChannelFilter {
+                    kinds: Some(vec![KIND_JOB_REQUEST]),
+                    require_mention: true,
+                });
             }
         }
     }
@@ -1444,11 +1458,17 @@ pub fn resolve_dynamic_channel_filter(
             }
 
             if !has_rule {
-                // No rules match — don't subscribe. Consistent with
-                // resolve_channel_filters() which omits unmatched channels.
-                return None;
+                return Some(ChannelFilter {
+                    kinds: Some(vec![KIND_JOB_REQUEST]),
+                    require_mention: true,
+                });
             }
 
+            if let Some(kinds) = &mut merged_kinds {
+                if !kinds.contains(&KIND_JOB_REQUEST) {
+                    kinds.push(KIND_JOB_REQUEST);
+                }
+            }
             Some(ChannelFilter {
                 kinds: merged_kinds,
                 require_mention,
@@ -1569,7 +1589,10 @@ mod tests {
         let result = resolve_channel_filters(&config, &channels, &[]);
 
         let f = result.get(&channels[0]).unwrap();
-        assert_eq!(f.kinds.as_ref().unwrap(), &[1, 7]);
+        assert_eq!(
+            f.kinds.as_ref().unwrap(),
+            &[1, 7, buzz_core::kind::KIND_JOB_REQUEST]
+        );
     }
 
     #[test]
@@ -1833,7 +1856,10 @@ mod tests {
         let result = resolve_channel_filters(&config, &channels, &[]);
 
         let f = result.get(&channels[0]).unwrap();
-        assert_eq!(f.kinds.as_ref().unwrap(), &[9, 7]);
+        assert_eq!(
+            f.kinds.as_ref().unwrap(),
+            &[9, 7, buzz_core::kind::KIND_JOB_REQUEST]
+        );
     }
 
     #[test]
@@ -1848,10 +1874,13 @@ mod tests {
         let discovered = vec![ch_a, ch_b];
         let result = resolve_channel_filters(&config, &discovered, &[]);
 
-        // Only ch_a should be present (intersection of override and discovered).
-        assert_eq!(result.len(), 1);
+        // ch_b remains present only for invariant delegated-job ingress.
+        assert_eq!(result.len(), 2);
         assert!(result.contains_key(&ch_a));
-        assert!(!result.contains_key(&ch_b));
+        assert_eq!(
+            result.get(&ch_b).and_then(|filter| filter.kinds.as_deref()),
+            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+        );
         assert!(!result.contains_key(&ch_unknown));
     }
 
@@ -1869,7 +1898,10 @@ mod tests {
         let result = resolve_channel_filters(&config, &[ch], &rules);
         assert_eq!(result.len(), 1);
         let f = result.get(&ch).unwrap();
-        assert_eq!(f.kinds.as_ref().unwrap(), &[9]);
+        assert_eq!(
+            f.kinds.as_ref().unwrap(),
+            &[9, buzz_core::kind::KIND_JOB_REQUEST]
+        );
         assert!(!f.require_mention);
     }
 
@@ -1886,9 +1918,12 @@ mod tests {
         )];
 
         let result = resolve_channel_filters(&config, &[ch_a, ch_b], &rules);
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
         assert!(result.contains_key(&ch_a));
-        assert!(!result.contains_key(&ch_b));
+        assert_eq!(
+            result.get(&ch_b).and_then(|filter| filter.kinds.as_deref()),
+            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+        );
     }
 
     #[test]
@@ -1928,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_mode_no_matching_rules_empty_result() {
+    fn test_config_mode_no_matching_rules_keeps_job_ingress() {
         let config = test_config(SubscribeMode::Config);
         let ch = Uuid::new_v4();
         let other_ch = Uuid::new_v4();
@@ -1941,7 +1976,12 @@ mod tests {
         )];
 
         let result = resolve_channel_filters(&config, &[ch], &rules);
-        assert!(result.is_empty());
+        let filter = result.get(&ch).expect("job-only filter");
+        assert_eq!(
+            filter.kinds.as_deref(),
+            Some(&[buzz_core::kind::KIND_JOB_REQUEST][..])
+        );
+        assert!(filter.require_mention);
     }
 
     #[test]

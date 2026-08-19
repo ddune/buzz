@@ -2269,6 +2269,38 @@ async fn ingest_event_inner(
         ));
     }
 
+    // A byte-identical, already-persisted job event is a replay, not a new
+    // authorization decision. Resolve it before mutable channel membership,
+    // managed-agent ownership, or successor policy checks so later roster
+    // changes cannot make a previously accepted signed event non-idempotent.
+    if matches!(
+        kind_u32,
+        KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_REJECTED
+            | KIND_JOB_COMPLETED
+            | KIND_JOB_BLOCKED
+            | KIND_JOB_DELEGATED
+    ) {
+        if let Some(stored) = state
+            .db
+            .get_event_by_id_including_deleted(tenant.community(), event.id.as_bytes())
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: {error}")))?
+        {
+            if stored.event != event {
+                return Err(IngestError::Rejected(
+                    "invalid: event ID conflicts with stored event".into(),
+                ));
+            }
+            return Ok(IngestResult {
+                event_id: event_id_hex,
+                accepted: true,
+                message: "duplicate: identical event".into(),
+            });
+        }
+    }
+
     let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
     // E1 (§4.8): fetch the community-scoped channel row once per request and
     // thread it through the gates below (membership open-fallback, archived

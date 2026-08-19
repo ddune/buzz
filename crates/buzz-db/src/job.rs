@@ -407,7 +407,7 @@ mod tests {
             content,
         )
         .tags([
-            Tag::parse(["job", &job.to_string()]).expect("job tag"),
+            Tag::parse(["d", &job.to_string()]).expect("job tag"),
             Tag::parse(["job-target", &target.public_key().to_hex()]).expect("target tag"),
             Tag::parse(["p", &target.public_key().to_hex()]).expect("routing tag"),
             Tag::parse(["h", &channel.to_string()]).expect("channel tag"),
@@ -426,7 +426,7 @@ mod tests {
     ) -> Event {
         EventBuilder::new(Kind::Custom(kind as u16), "state change")
             .tags([
-                Tag::parse(["job", &job.to_string()]).expect("job tag"),
+                Tag::parse(["d", &job.to_string()]).expect("job tag"),
                 Tag::parse(["job-request", &request.id.to_hex()]).expect("request tag"),
                 Tag::parse(["job-parent", &parent.id.to_hex()]).expect("parent tag"),
                 Tag::parse(["h", &channel.to_string()]).expect("channel tag"),
