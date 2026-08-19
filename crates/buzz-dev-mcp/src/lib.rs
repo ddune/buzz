@@ -155,21 +155,21 @@ fn followup_shell_command_allowed(command: &str) -> bool {
 }
 
 fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> bool {
-    if command
-        .chars()
-        .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r'))
-    {
+    let Some(words) = restricted_shell_words(command) else {
         return false;
-    }
-    let words: Vec<&str> = command.split_whitespace().collect();
-    if words.get(..3) != Some(&["buzz", "messages", "send"][..]) {
+    };
+    if words
+        .get(..3)
+        .map(|words| words.iter().map(String::as_str).collect::<Vec<_>>())
+        != Some(vec!["buzz", "messages", "send"])
+    {
         return false;
     }
     let value_after = |flag: &str| {
         words
             .iter()
-            .position(|word| *word == flag)
-            .and_then(|index| words.get(index + 1).copied())
+            .position(|word| word == flag)
+            .and_then(|index| words.get(index + 1).map(String::as_str))
     };
     let reply_to = value_after("--reply-to");
     value_after("--channel") == Some(expected_channel)
@@ -179,7 +179,67 @@ fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> 
         })
         && !words
             .iter()
-            .any(|word| matches!(*word, "--kind" | "--broadcast" | "--file"))
+            .any(|word| matches!(word.as_str(), "--kind" | "--broadcast" | "--file"))
+}
+
+/// Parse a single shell command while rejecting operators and expansion. Shell
+/// metacharacters are harmless inside single quotes, which lets ordinary
+/// Markdown status text contain backticks without opening command execution.
+fn restricted_shell_words(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut word = String::new();
+    let mut words = Vec::new();
+    for ch in command.chars() {
+        if matches!(ch, '\n' | '\r') {
+            return None;
+        }
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => escaped = true,
+                '$' | '`' => return None,
+                _ => word.push(ch),
+            },
+            Quote::None => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => escaped = true,
+                ';' | '|' | '&' | '>' | '<' | '`' | '$' => return None,
+                ch if ch.is_whitespace() => {
+                    if !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(ch),
+            },
+        }
+    }
+    if escaped || !matches!(quote, Quote::None) {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
 }
 
 fn file_mutation_allowed(evaluation: bool, followup_readonly: bool) -> bool {
@@ -349,7 +409,7 @@ mod evaluation_tests {
         let event = "ab".repeat(32);
         assert!(followup_shell_command_allowed_for(
             &format!(
-                "buzz messages send --channel {channel} --content 'Work is checkpointed.' --reply-to {event}"
+                "buzz messages send --channel {channel} --content 'Work on `marker-a.txt` is checkpointed.' --reply-to {event}"
             ),
             channel,
         ));
