@@ -2015,6 +2015,46 @@ async fn ingest_event_inner(
     }
     let event = std::sync::Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone());
 
+    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
+    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
+        return Err(IngestError::AuthFailed(
+            "invalid: event pubkey does not match authenticated identity".into(),
+        ));
+    }
+
+    // A byte-identical, already-persisted job event is a replay, not a new
+    // authorization decision. Resolve it immediately after cryptographic and
+    // authenticated-signer verification, before timestamp, token-scope,
+    // channel membership, ownership, or successor policy gates. Those gates
+    // are mutable and cannot make a committed signed event non-idempotent.
+    if matches!(
+        kind_u32,
+        KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_REJECTED
+            | KIND_JOB_COMPLETED
+            | KIND_JOB_BLOCKED
+            | KIND_JOB_DELEGATED
+    ) {
+        if let Some(stored) = state
+            .db
+            .get_event_by_id_including_deleted(tenant.community(), event.id.as_bytes())
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: {error}")))?
+        {
+            if stored.event != event {
+                return Err(IngestError::Rejected(
+                    "invalid: event ID conflicts with stored event".into(),
+                ));
+            }
+            return Ok(IngestResult {
+                event_id: event_id_hex,
+                accepted: true,
+                message: "duplicate: identical event".into(),
+            });
+        }
+    }
+
     const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
@@ -2031,13 +2071,6 @@ async fn ingest_event_inner(
             MAX_EVENT_CONTENT_BYTES,
             event.content.len()
         )));
-    }
-
-    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
-        return Err(IngestError::AuthFailed(
-            "invalid: event pubkey does not match authenticated identity".into(),
-        ));
     }
 
     let required = match required_scope_for_kind(kind_u32, &event) {
@@ -2267,38 +2300,6 @@ async fn ingest_event_inner(
         return Err(IngestError::AuthFailed(
             "restricted: channel-scoped tokens cannot publish global events".into(),
         ));
-    }
-
-    // A byte-identical, already-persisted job event is a replay, not a new
-    // authorization decision. Resolve it before mutable channel membership,
-    // managed-agent ownership, or successor policy checks so later roster
-    // changes cannot make a previously accepted signed event non-idempotent.
-    if matches!(
-        kind_u32,
-        KIND_JOB_REQUEST
-            | KIND_JOB_ACCEPTED
-            | KIND_JOB_REJECTED
-            | KIND_JOB_COMPLETED
-            | KIND_JOB_BLOCKED
-            | KIND_JOB_DELEGATED
-    ) {
-        if let Some(stored) = state
-            .db
-            .get_event_by_id_including_deleted(tenant.community(), event.id.as_bytes())
-            .await
-            .map_err(|error| IngestError::Internal(format!("error: {error}")))?
-        {
-            if stored.event != event {
-                return Err(IngestError::Rejected(
-                    "invalid: event ID conflicts with stored event".into(),
-                ));
-            }
-            return Ok(IngestResult {
-                event_id: event_id_hex,
-                accepted: true,
-                message: "duplicate: identical event".into(),
-            });
-        }
     }
 
     let pubkey_bytes = auth.pubkey().to_bytes().to_vec();

@@ -1015,18 +1015,18 @@ fn filter_to_query_params(
     // Critical for parameterized replaceable lookups (authors + kinds + #d)
     // where many events from the same author would push the target past LIMIT.
     //
-    // Only push when the filter exclusively targets NIP-33 kinds (30000–39999),
-    // because `d_tag` is only populated for those kinds. Non-NIP-33 events have
-    // `d_tag = NULL`, so pushing `AND d_tag = $N` for a mixed-kind or kindless
-    // filter would silently exclude non-NIP-33 rows that match via their tags.
-    let filter_is_nip33_only = kinds.as_ref().is_some_and(|ks| {
+    // Job events also persist their stable job identifier in this column. Only
+    // push when every selected kind is guaranteed to populate d_tag; otherwise
+    // a mixed or kindless filter would silently exclude matching NULL rows.
+    let filter_has_indexed_d_only = kinds.as_ref().is_some_and(|ks| {
         !ks.is_empty()
-            && ks
-                .iter()
-                .all(|&k| buzz_core::kind::is_parameterized_replaceable(k as u32))
+            && ks.iter().all(|&k| {
+                buzz_core::kind::is_parameterized_replaceable(k as u32)
+                    || matches!(k as u32, 43001..=43006)
+            })
     });
     let d_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::D);
-    let (d_tag, d_tags) = if filter_is_nip33_only {
+    let (d_tag, d_tags) = if filter_has_indexed_d_only {
         let values = filter.generic_tags.get(&d_tag_key);
         match values.map(|v| v.len()) {
             Some(1) => (
@@ -2017,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn d_tag_pushdown_only_for_nip33_kinds() {
+    fn d_tag_pushdown_for_nip33_and_delegated_job_kinds() {
         let d_tag = SingleLetterTag::lowercase(Alphabet::D);
 
         // NIP-33 kind with #d → pushdown active
@@ -2030,6 +2030,25 @@ mod tests {
             buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
         );
         assert_eq!(q.d_tag, Some("my-slug".to_string()));
+
+        // Delegated job events persist their stable UUID in the same indexed
+        // column, so exact lifecycle-chain lookup must be pushed before LIMIT.
+        let job_filter = Filter::new()
+            .kinds([
+                nostr::Kind::Custom(buzz_core::kind::KIND_JOB_REQUEST as u16),
+                nostr::Kind::Custom(buzz_core::kind::KIND_JOB_ACCEPTED as u16),
+                nostr::Kind::Custom(buzz_core::kind::KIND_JOB_COMPLETED as u16),
+            ])
+            .custom_tags(d_tag, ["00000000-0000-0000-0000-000000000001"]);
+        let job_query = filter_to_query_params(
+            &job_filter,
+            None,
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        );
+        assert_eq!(
+            job_query.d_tag,
+            Some("00000000-0000-0000-0000-000000000001".to_string())
+        );
 
         // Non-NIP-33 kind with #d → pushdown NOT active (would miss rows with d_tag=NULL)
         let non_nip33_filter = Filter::new()

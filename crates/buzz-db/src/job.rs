@@ -298,11 +298,17 @@ async fn insert_event(
     created_at: DateTime<Utc>,
 ) -> Result<(), JobWriteError> {
     let tags = serde_json::to_value(&event.tags).map_err(DbError::from)?;
+    let d_tag = event
+        .tags
+        .iter()
+        .find(|tag| tag.as_slice().first().is_some_and(|value| value == "d"))
+        .and_then(|tag| tag.as_slice().get(1))
+        .cloned();
     let sig = event.sig.serialize();
     let result = sqlx::query(
         "INSERT INTO events \
-         (community_id,id,pubkey,created_at,kind,tags,content,sig,received_at,channel_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),$9) ON CONFLICT DO NOTHING",
+         (community_id,id,pubkey,created_at,kind,tags,content,sig,received_at,channel_id,d_tag) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),$9,$10) ON CONFLICT DO NOTHING",
     )
     .bind(community.as_uuid())
     .bind(event.id.as_bytes().as_slice())
@@ -313,6 +319,7 @@ async fn insert_event(
     .bind(&event.content)
     .bind(sig.as_slice())
     .bind(channel_id)
+    .bind(d_tag)
     .execute(&mut **tx)
     .await?;
     if result.rows_affected() != 1 {
