@@ -151,10 +151,21 @@ fn followup_shell_command_allowed(command: &str) -> bool {
     let Ok(expected_channel) = std::env::var("BUZZ_JOB_FOLLOWUP_CHANNEL_ID") else {
         return false;
     };
-    followup_shell_command_allowed_for(command, &expected_channel)
+    let Ok(expected_reply_ids) = std::env::var("BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS") else {
+        return false;
+    };
+    let expected_reply_ids: std::collections::HashSet<&str> = expected_reply_ids
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .collect();
+    followup_shell_command_allowed_for(command, &expected_channel, &expected_reply_ids)
 }
 
-fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> bool {
+fn followup_shell_command_allowed_for(
+    command: &str,
+    expected_channel: &str,
+    expected_reply_ids: &std::collections::HashSet<&str>,
+) -> bool {
     let Some(words) = restricted_shell_words(command) else {
         return false;
     };
@@ -165,21 +176,24 @@ fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> 
     {
         return false;
     }
-    let value_after = |flag: &str| {
-        words
-            .iter()
-            .position(|word| word == flag)
-            .and_then(|index| words.get(index + 1).map(String::as_str))
-    };
-    let reply_to = value_after("--reply-to");
-    value_after("--channel") == Some(expected_channel)
-        && value_after("--content").is_some_and(|content| content != "-")
-        && reply_to.is_some_and(|event_id| {
-            event_id.len() == 64 && event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-        && !words
-            .iter()
-            .any(|word| matches!(word.as_str(), "--kind" | "--broadcast" | "--file"))
+    if words.len() != 9 {
+        return false;
+    }
+    let mut options = std::collections::HashMap::<&str, &str>::new();
+    for pair in words[3..].chunks_exact(2) {
+        if !matches!(pair[0].as_str(), "--channel" | "--content" | "--reply-to")
+            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return false;
+        }
+    }
+    options.get("--channel").copied() == Some(expected_channel)
+        && options
+            .get("--content")
+            .is_some_and(|content| !content.is_empty() && *content != "-")
+        && options
+            .get("--reply-to")
+            .is_some_and(|event_id| expected_reply_ids.contains(event_id))
 }
 
 /// Parse a single shell command while rejecting operators and expansion. Shell
@@ -223,7 +237,7 @@ fn restricted_shell_words(command: &str) -> Option<Vec<String>> {
                 '\'' => quote = Quote::Single,
                 '"' => quote = Quote::Double,
                 '\\' => escaped = true,
-                ';' | '|' | '&' | '>' | '<' | '`' | '$' => return None,
+                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '#' => return None,
                 ch if ch.is_whitespace() => {
                     if !word.is_empty() {
                         words.push(std::mem::take(&mut word));
@@ -407,22 +421,30 @@ mod evaluation_tests {
     fn accepted_job_followup_allows_only_a_threaded_reply_in_its_channel() {
         let channel = "00000000-0000-0000-0000-000000000042";
         let event = "ab".repeat(32);
+        let wrong_event = "cd".repeat(32);
+        let allowed = std::collections::HashSet::from([event.as_str()]);
         assert!(followup_shell_command_allowed_for(
             &format!(
                 "buzz messages send --channel {channel} --content 'Work on `marker-a.txt` is checkpointed.' --reply-to {event}"
             ),
             channel,
+            &allowed,
         ));
         for command in [
             format!("buzz messages send --channel {channel} --content - --reply-to {event}"),
             format!("buzz messages send --channel {channel} --content ok"),
             format!("buzz messages send --channel {channel} --content ok --reply-to {event} --file secret"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --file=secret"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --kind=9"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {wrong_event}"),
+            format!("buzz messages send --channel {channel} --content ok # --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --reply-to {event}"),
             format!("buzz messages send --channel 00000000-0000-0000-0000-000000000099 --content ok --reply-to {event}"),
             format!("buzz messages send --channel {channel} --content 'ok'; touch marker --reply-to {event}"),
             "buzz jobs complete --job id".into(),
         ] {
             assert!(
-                !followup_shell_command_allowed_for(&command, channel),
+                !followup_shell_command_allowed_for(&command, channel, &allowed),
                 "admitted: {command}"
             );
         }

@@ -1014,6 +1014,7 @@ struct NewSessionChannelContext<'a> {
     id: Option<Uuid>,
     channel_type: Option<&'a str>,
     capability_profile: SessionCapabilityProfile,
+    followup_reply_event_ids: &'a [String],
 }
 
 /// Capability authority selected structurally from the queued batch.
@@ -1077,6 +1078,7 @@ async fn create_session_and_apply_model(
         channel.channel_type,
         ctx.session_title.as_deref(),
         channel.capability_profile,
+        channel.followup_reply_event_ids,
     );
 
     let resp = agent
@@ -1311,6 +1313,7 @@ fn mcp_servers_with_git_origin(
     channel_type: Option<&str>,
     agent_name: Option<&str>,
     capability_profile: SessionCapabilityProfile,
+    followup_reply_event_ids: &[String],
 ) -> Vec<McpServer> {
     let mut servers = servers.to_vec();
     if capability_profile.strips_native_tools() {
@@ -1361,6 +1364,7 @@ fn mcp_servers_with_git_origin(
                 && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
                 && entry.name != "BUZZ_JOB_FOLLOWUP_READONLY"
                 && entry.name != "BUZZ_JOB_FOLLOWUP_CHANNEL_ID"
+                && entry.name != "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS"
         });
         match capability_profile {
             SessionCapabilityProfile::JobDecision => {
@@ -1382,6 +1386,12 @@ fn mcp_servers_with_git_origin(
                     server.env.push(EnvVar {
                         name: "BUZZ_JOB_FOLLOWUP_CHANNEL_ID".into(),
                         value: channel_id.to_string(),
+                    });
+                }
+                if !followup_reply_event_ids.is_empty() {
+                    server.env.push(EnvVar {
+                        name: "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS".into(),
+                        value: followup_reply_event_ids.join(","),
                     });
                 }
             }
@@ -1901,6 +1911,13 @@ pub async fn run_prompt_task(
     } else {
         SessionCapabilityProfile::Ordinary
     };
+    let followup_reply_event_ids: Vec<String> = batch
+        .as_ref()
+        .filter(|_| job_followup_readonly)
+        .into_iter()
+        .flat_map(|batch| batch.events.iter())
+        .map(|event| event.event.id.to_hex())
+        .collect();
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.channel_id),
@@ -2129,6 +2146,7 @@ pub async fn run_prompt_task(
                         id: Some(*cid),
                         channel_type: origin_channel_type.as_deref(),
                         capability_profile,
+                        followup_reply_event_ids: &followup_reply_event_ids,
                     },
                 )
                 .await
@@ -2195,6 +2213,7 @@ pub async fn run_prompt_task(
                         id: None,
                         channel_type: None,
                         capability_profile: SessionCapabilityProfile::Ordinary,
+                        followup_reply_event_ids: &[],
                     },
                 )
                 .await
@@ -4887,6 +4906,7 @@ mod tests {
             Some("stream"),
             None,
             SessionCapabilityProfile::Ordinary,
+            &[],
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
@@ -4909,6 +4929,7 @@ mod tests {
             Some("dm"),
             Some("Builder"),
             SessionCapabilityProfile::Ordinary,
+            &[],
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
@@ -4937,6 +4958,7 @@ mod tests {
             Some("stream"),
             None,
             SessionCapabilityProfile::JobDecision,
+            &[],
         );
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].command, "buzz-dev-mcp");
@@ -4957,6 +4979,7 @@ mod tests {
             Some("stream"),
             None,
             SessionCapabilityProfile::JobDecision,
+            &[],
         );
         let execution = mcp_servers_with_git_origin(
             &[test_mcp_server()],
@@ -4964,6 +4987,7 @@ mod tests {
             Some("stream"),
             None,
             SessionCapabilityProfile::JobExecution,
+            &[],
         );
 
         assert_eq!(evaluation[0].command, execution[0].command);
@@ -4981,12 +5005,14 @@ mod tests {
         unknown.name = "external".into();
         unknown.command = "external-mcp".into();
         let channel = Uuid::new_v4();
+        let reply_ids = vec!["ab".repeat(32), "cd".repeat(32)];
         let servers = mcp_servers_with_git_origin(
             &[test_mcp_server(), unknown],
             Some(channel),
             Some("stream"),
             None,
             SessionCapabilityProfile::JobFollowupReadonly,
+            &reply_ids,
         );
 
         assert_eq!(servers.len(), 1);
@@ -4997,6 +5023,9 @@ mod tests {
             .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_READONLY" && entry.value == "1"));
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_JOB_FOLLOWUP_CHANNEL_ID" && entry.value == channel.to_string()
+        }));
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS" && entry.value == reply_ids.join(",")
         }));
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(!servers[0].env.iter().any(|entry| entry.name == name));
@@ -8814,6 +8843,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8853,6 +8883,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8889,6 +8920,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8924,6 +8956,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8966,6 +8999,7 @@ exit 0"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9095,6 +9129,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9168,6 +9203,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9225,6 +9261,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9269,6 +9306,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9312,6 +9350,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9380,6 +9419,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9419,6 +9459,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9494,6 +9535,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9537,6 +9579,7 @@ done"#
                 channel_type: None,
 
                 capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await

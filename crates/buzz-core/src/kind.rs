@@ -528,6 +528,8 @@ pub const KIND_JOB_BLOCKED: u32 = 43005;
 pub const KIND_JOB_DELEGATED: u32 = 43006;
 /// Durable execution-attempt control for an accepted delegated job.
 pub const KIND_JOB_EXECUTION_ATTEMPT: u32 = 43007;
+/// Agent-signed admission of supplemental conversation for an accepted job.
+pub const KIND_JOB_SUPPLEMENTAL_CONTEXT: u32 = 43008;
 
 /// Relay-signed notification: the target pubkey was added to a channel.
 /// Stored globally (channel_id = None) with p-tag = target, h-tag = channel UUID.

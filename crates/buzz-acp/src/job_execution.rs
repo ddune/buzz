@@ -6,7 +6,7 @@ use buzz_core::delegated_job::{parse_job_lifecycle, parse_job_request, JobState}
 use buzz_core::execution_attempt::{parse_execution_attempt, AttemptAction};
 use buzz_core::kind::{
     KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED, KIND_JOB_DELEGATED,
-    KIND_JOB_EXECUTION_ATTEMPT, KIND_JOB_REJECTED, KIND_JOB_REQUEST,
+    KIND_JOB_EXECUTION_ATTEMPT, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_JOB_SUPPLEMENTAL_CONTEXT,
 };
 use nostr::{Event, EventBuilder, Filter, Kind, Tag};
 use uuid::Uuid;
@@ -159,6 +159,9 @@ pub struct ContinuationWork {
     pub execution: JobExecutionContext,
     /// Relay-recovered context for the interrupted generation.
     pub supplemental_messages: Vec<JobSupplementalMessage>,
+    /// Exact admitted source events still eligible for an optional restricted
+    /// conversational reply. These never carry execution authority.
+    pub unanswered_supplemental_events: Vec<Event>,
 }
 
 /// One authoritative reconciliation snapshot. Guards are returned even when
@@ -243,11 +246,18 @@ fn project_jobs(events: &[Event]) -> HashMap<Uuid, JobProjection> {
 pub async fn reconcile(
     rest: &RestClient,
     already_queued: &HashSet<Uuid>,
-    deferred_jobs: &HashSet<Uuid>,
+    deferred_channels: &HashSet<Uuid>,
     lease_seconds: u64,
 ) -> Result<ReconcileSnapshot, RelayError> {
     let events = query_events(rest, None).await?;
-    reconcile_events(rest, already_queued, deferred_jobs, lease_seconds, events).await
+    reconcile_events(
+        rest,
+        already_queued,
+        deferred_channels,
+        lease_seconds,
+        events,
+    )
+    .await
 }
 
 /// Reconcile one accepted job through the same canonical state machine used by
@@ -313,13 +323,13 @@ fn reconcile_filters(pubkey: &str, job_id: Option<Uuid>) -> Result<Vec<Filter>, 
         serde_json::json!([
             {"kinds":[KIND_JOB_REQUEST], "#p":[pubkey], "#d":coordinate},
             {"kinds":[KIND_JOB_ACCEPTED,KIND_JOB_REJECTED,KIND_JOB_COMPLETED,KIND_JOB_BLOCKED,KIND_JOB_DELEGATED], "authors":[pubkey], "#d":coordinate},
-            {"kinds":[KIND_JOB_EXECUTION_ATTEMPT], "authors":[pubkey], "#d":coordinate}
+            {"kinds":[KIND_JOB_EXECUTION_ATTEMPT,KIND_JOB_SUPPLEMENTAL_CONTEXT], "authors":[pubkey], "#d":coordinate}
         ])
     } else {
         serde_json::json!([
             {"kinds":[KIND_JOB_REQUEST], "#p":[pubkey]},
             {"kinds":[KIND_JOB_ACCEPTED,KIND_JOB_REJECTED,KIND_JOB_COMPLETED,KIND_JOB_BLOCKED,KIND_JOB_DELEGATED], "authors":[pubkey]},
-            {"kinds":[KIND_JOB_EXECUTION_ATTEMPT], "authors":[pubkey]}
+            {"kinds":[KIND_JOB_EXECUTION_ATTEMPT,KIND_JOB_SUPPLEMENTAL_CONTEXT], "authors":[pubkey]}
         ])
     };
     serde_json::from_value(raw_filters).map_err(RelayError::Json)
@@ -328,7 +338,7 @@ fn reconcile_filters(pubkey: &str, job_id: Option<Uuid>) -> Result<Vec<Filter>, 
 async fn reconcile_events(
     rest: &RestClient,
     already_queued: &HashSet<Uuid>,
-    deferred_jobs: &HashSet<Uuid>,
+    deferred_channels: &HashSet<Uuid>,
     lease_seconds: u64,
     events: Vec<Event>,
 ) -> Result<ReconcileSnapshot, RelayError> {
@@ -338,12 +348,18 @@ async fn reconcile_events(
         Uuid,
         Vec<(Event, buzz_core::execution_attempt::ExecutionAttemptEvent)>,
     > = HashMap::new();
+    let mut supplemental_admissions = HashMap::<Uuid, Vec<(Event, SupplementalAdmission)>>::new();
     for event in events {
         if let Ok(attempt) = parse_execution_attempt(&event) {
             attempts
                 .entry(attempt.job_id)
                 .or_default()
                 .push((event, attempt));
+        } else if let Ok(admission) = parse_supplemental_admission(&event) {
+            supplemental_admissions
+                .entry(admission.job_id)
+                .or_default()
+                .push((event, admission));
         }
     }
 
@@ -363,32 +379,24 @@ async fn reconcile_events(
             channel_id: request.channel_id,
             last_execution: latest_execution_context(&history),
         });
-        if deferred_jobs.contains(&job_id) {
+        if deferred_channels.contains(&request.channel_id) {
             continue;
         }
-        let supplemental_messages = match recover_supplemental_messages(
-            rest,
-            &history,
-            request.channel_id,
-        )
-        .await?
-        {
-            Some(messages)
-                if messages.is_empty()
-                    || messages
-                        .last()
-                        .is_some_and(|message| message.response_event_id.is_none()) =>
-            {
-                tracing::info!(
-                    %job_id,
-                    "deferring delegated-job continuation until restricted follow-up response is durable"
-                );
-                continue;
-            }
-            Some(messages) => messages,
-            None => Vec::new(),
-        };
         let next = reconcile_decision(&history, chrono::Utc::now().timestamp());
+        let continuation_generation = match next {
+            ReconcileDecision::Use(index) => history[index].1.generation,
+            ReconcileDecision::Create(generation) => generation,
+            ReconcileDecision::None => continue,
+        };
+        let (supplemental_messages, unanswered_supplemental_events) =
+            recover_supplemental_messages(
+                rest,
+                request.channel_id,
+                &request.request_event_id,
+                supplemental_admissions.remove(&job_id).unwrap_or_default(),
+                continuation_generation,
+            )
+            .await?;
         let (runnable_event, runnable) = match next {
             ReconcileDecision::Use(index) => history[index].clone(),
             ReconcileDecision::Create(generation) => {
@@ -450,6 +458,7 @@ async fn reconcile_events(
                 ..execution
             },
             supplemental_messages,
+            unanswered_supplemental_events,
         });
     }
     Ok(ReconcileSnapshot {
@@ -492,6 +501,121 @@ struct FollowupBoundaryDetail {
     supplemental_event_id: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SupplementalAdmissionContent {
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupplementalAdmission {
+    job_id: Uuid,
+    request_event_id: String,
+    channel_id: Uuid,
+    source_event_id: String,
+    source_author: String,
+    continuation_generation: i64,
+    content: String,
+}
+
+/// Durably attest that an inbound event passed ACP author/rule admission while
+/// an accepted job owned the channel. Recovery consumes only these exact,
+/// agent-signed identities; it never projects arbitrary later channel traffic.
+pub async fn persist_supplemental_admission(
+    rest: &RestClient,
+    guard: &AcceptedJobGuard,
+    source: &Event,
+    continuation_generation: i64,
+) -> Result<Event, RelayError> {
+    if continuation_generation < 1 {
+        return Err(RelayError::Http(
+            "continuation generation must be positive".into(),
+        ));
+    }
+    let content = serde_json::to_string(&SupplementalAdmissionContent {
+        content: source.content.clone(),
+    })?;
+    let event = EventBuilder::new(Kind::Custom(KIND_JOB_SUPPLEMENTAL_CONTEXT as u16), content)
+        .tags([
+            Tag::parse(["d", &guard.job_id.to_string()])?,
+            Tag::parse(["job-request", &guard.request_event_id])?,
+            Tag::parse(["job-target", &rest.keys.public_key().to_hex()])?,
+            Tag::parse(["h", &guard.channel_id.to_string()])?,
+            Tag::parse(["supplemental-event", &source.id.to_hex()])?,
+            Tag::parse(["supplemental-author", &source.pubkey.to_hex()])?,
+            Tag::parse([
+                "continuation-generation",
+                &continuation_generation.to_string(),
+            ])?,
+        ])
+        .sign_with_keys(&rest.keys)?;
+    require_accepted(rest.submit_event(&event).await?)?;
+    Ok(event)
+}
+
+fn parse_supplemental_admission(event: &Event) -> Result<SupplementalAdmission, RelayError> {
+    if event.kind.as_u16() as u32 != KIND_JOB_SUPPLEMENTAL_CONTEXT {
+        return Err(RelayError::Http("not supplemental context".into()));
+    }
+    let one = |name: &str| -> Result<String, RelayError> {
+        let values: Vec<String> = event
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let parts = tag.as_slice();
+                (parts.first().map(String::as_str) == Some(name))
+                    .then(|| parts.get(1).cloned())
+                    .flatten()
+            })
+            .collect();
+        if values.len() == 1 {
+            Ok(values[0].clone())
+        } else {
+            Err(RelayError::Http(format!(
+                "supplemental context requires exactly one {name} tag"
+            )))
+        }
+    };
+    let job_id = Uuid::parse_str(&one("d")?)
+        .map_err(|error| RelayError::Http(format!("invalid supplemental job id: {error}")))?;
+    let channel_id = Uuid::parse_str(&one("h")?)
+        .map_err(|error| RelayError::Http(format!("invalid supplemental channel: {error}")))?;
+    let continuation_generation = one("continuation-generation")?
+        .parse::<i64>()
+        .map_err(|error| RelayError::Http(format!("invalid continuation generation: {error}")))?;
+    if continuation_generation < 1 {
+        return Err(RelayError::Http(
+            "continuation generation must be positive".into(),
+        ));
+    }
+    let target = one("job-target")?;
+    if target != event.pubkey.to_hex() {
+        return Err(RelayError::Http(
+            "supplemental job-target must match signer".into(),
+        ));
+    }
+    let source_event_id = one("supplemental-event")?;
+    let source_author = one("supplemental-author")?;
+    if !is_hex_64(&source_event_id) || !is_hex_64(&source_author) {
+        return Err(RelayError::Http(
+            "invalid supplemental event or author identity".into(),
+        ));
+    }
+    let content: SupplementalAdmissionContent = serde_json::from_str(&event.content)?;
+    Ok(SupplementalAdmission {
+        job_id,
+        request_event_id: one("job-request")?,
+        channel_id,
+        source_event_id,
+        source_author,
+        continuation_generation,
+        content: content.content,
+    })
+}
+
+fn is_hex_64(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub fn followup_boundary_detail(event_id: &str) -> Result<String, serde_json::Error> {
     serde_json::to_string(&FollowupBoundaryDetail {
         supplemental_event_id: event_id.to_owned(),
@@ -500,73 +624,76 @@ pub fn followup_boundary_detail(event_id: &str) -> Result<String, serde_json::Er
 
 async fn recover_supplemental_messages(
     rest: &RestClient,
-    history: &[(Event, buzz_core::execution_attempt::ExecutionAttemptEvent)],
     channel_id: Uuid,
-) -> Result<Option<Vec<JobSupplementalMessage>>, RelayError> {
-    let Some((_, boundary)) = history
+    request_event_id: &str,
+    mut admissions: Vec<(Event, SupplementalAdmission)>,
+    continuation_generation: i64,
+) -> Result<(Vec<JobSupplementalMessage>, Vec<Event>), RelayError> {
+    admissions.retain(|(_, admission)| {
+        admission.channel_id == channel_id
+            && admission.request_event_id == request_event_id
+            && admission.continuation_generation == continuation_generation
+    });
+    admissions.sort_by_key(|(event, _)| (event.created_at, event.id));
+    let mut seen = HashSet::new();
+    admissions.retain(|(_, admission)| seen.insert(admission.source_event_id.clone()));
+    if admissions.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let source_ids: Vec<String> = admissions
         .iter()
-        .filter(|(_, attempt)| attempt.action == AttemptAction::Finish)
-        .filter_map(|(event, attempt)| {
-            serde_json::from_str::<FollowupBoundaryDetail>(&attempt.detail)
-                .ok()
-                .map(|detail| (event, detail))
-        })
-        .max_by_key(|(event, _)| (event.created_at, event.id))
-    else {
-        return Ok(None);
-    };
-
-    let filter: Filter = serde_json::from_value(serde_json::json!({
+        .map(|(_, admission)| admission.source_event_id.clone())
+        .collect();
+    let source_filter: Filter = serde_json::from_value(serde_json::json!({
+        "ids": source_ids,
         "kinds": [buzz_core::kind::KIND_STREAM_MESSAGE],
         "#h": [channel_id.to_string()]
-    }))
-    .map_err(RelayError::Json)?;
-    let mut channel_events = rest.query_all(&filter).await?;
-    channel_events.sort_by_key(|event| (event.created_at, event.id));
-    Ok(Some(project_supplemental_messages(
-        &channel_events,
-        rest.keys.public_key(),
-        &boundary.supplemental_event_id,
-    )))
+    }))?;
+    let sources = rest.query_all(&source_filter).await?;
+    let response_filter: Filter = serde_json::from_value(serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_STREAM_MESSAGE],
+        "authors": [rest.keys.public_key().to_hex()],
+        "#h": [channel_id.to_string()],
+        "#e": source_ids
+    }))?;
+    let responses = rest.query_all(&response_filter).await?;
+    Ok(project_admitted_supplemental(
+        admissions, &sources, &responses,
+    ))
 }
 
-fn project_supplemental_messages(
-    channel_events: &[Event],
-    self_pubkey: nostr::PublicKey,
-    boundary_event_id: &str,
-) -> Vec<JobSupplementalMessage> {
-    let Some(boundary_event) = channel_events
-        .iter()
-        .find(|event| event.id.to_hex() == boundary_event_id)
-    else {
-        return Vec::new();
-    };
-    let boundary_created_at = boundary_event.created_at;
-    let sources: Vec<&Event> = channel_events
-        .iter()
-        .filter(|event| event.created_at >= boundary_created_at && event.pubkey != self_pubkey)
-        .collect();
-    let responses: Vec<&Event> = channel_events
-        .iter()
-        .filter(|event| event.created_at >= boundary_created_at && event.pubkey == self_pubkey)
-        .collect();
-    sources
-        .into_iter()
-        .map(|source| {
-            let response = responses.iter().copied().find(|response| {
-                crate::queue::parse_thread_tags(response)
-                    .parent_event_id
-                    .as_deref()
-                    == Some(source.id.to_hex().as_str())
-            });
-            JobSupplementalMessage {
-                event_id: source.id.to_hex(),
-                content: source.content.clone(),
-                response_event_id: response.map(|event| event.id.to_hex()),
-                response_content: response.map(|event| event.content.clone()),
+fn project_admitted_supplemental(
+    admissions: Vec<(Event, SupplementalAdmission)>,
+    sources: &[Event],
+    responses: &[Event],
+) -> (Vec<JobSupplementalMessage>, Vec<Event>) {
+    let mut messages = Vec::new();
+    let mut unanswered = Vec::new();
+    for (_, admission) in admissions {
+        let source = sources.iter().find(|event| {
+            event.id.to_hex() == admission.source_event_id
+                && event.pubkey.to_hex() == admission.source_author
+                && event.content == admission.content
+        });
+        let response = responses.iter().find(|response| {
+            crate::queue::parse_thread_tags(response)
+                .parent_event_id
+                .as_deref()
+                == Some(admission.source_event_id.as_str())
+        });
+        messages.push(JobSupplementalMessage {
+            event_id: admission.source_event_id,
+            content: admission.content,
+            response_event_id: response.map(|event| event.id.to_hex()),
+            response_content: response.map(|event| event.content.clone()),
+        });
+        if response.is_none() {
+            if let Some(source) = source {
+                unanswered.push(source.clone());
             }
-        })
-        .collect()
+        }
+    }
+    (messages, unanswered)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,6 +931,24 @@ mod tests {
     }
 
     #[test]
+    fn cancel_and_merge_finish_mints_next_generation_without_followup_reply() {
+        let runnable = attempt_event("runnable", 1, None);
+        let mut claim = attempt_event("claim", 1, Some(200));
+        claim.1.parent_event_id = Some(runnable.0.id.to_hex());
+        let mut finish = attempt_event("finish", 1, None);
+        finish.1.parent_event_id = Some(claim.0.id.to_hex());
+        finish.1.turn_id = claim.1.turn_id.clone();
+        finish.1.outcome = Some("cancel_and_merge".into());
+        finish.1.detail = followup_boundary_detail(&"ab".repeat(32)).expect("detail");
+
+        assert_eq!(
+            reconcile_decision(&[runnable, claim, finish], 100),
+            ReconcileDecision::Create(2),
+            "a conversational response is optional and cannot gate continuation"
+        );
+    }
+
+    #[test]
     fn requested_rejected_and_terminal_jobs_are_filtered_before_attempt_reconciliation() {
         for state in [
             JobState::Requested,
@@ -918,51 +1063,71 @@ mod tests {
     }
 
     #[test]
-    fn restart_projection_recovers_all_followups_and_the_durable_latest_response() {
+    fn supplemental_admission_is_exactly_bound_to_job_generation_and_source() {
         let user = Keys::generate();
         let agent = Keys::generate();
+        let job_id = Uuid::new_v4();
         let channel = Uuid::new_v4();
-        let first = EventBuilder::new(
+        let source = EventBuilder::new(
             Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
             "status?",
         )
-        .custom_created_at(Timestamp::from(100))
         .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
         .sign_with_keys(&user)
         .expect("event");
-        let second = EventBuilder::new(
-            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
-            "also preserve this",
+        let admission = EventBuilder::new(
+            Kind::Custom(KIND_JOB_SUPPLEMENTAL_CONTEXT as u16),
+            serde_json::to_string(&SupplementalAdmissionContent {
+                content: source.content.clone(),
+            })
+            .expect("content"),
         )
-        .custom_created_at(Timestamp::from(101))
-        .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
-        .sign_with_keys(&user)
-        .expect("event");
-        let response = EventBuilder::new(
-            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
-            "Checkpoint retained; tracked continuation remains.",
-        )
-        .custom_created_at(Timestamp::from(102))
         .tags([
+            Tag::parse(["d", &job_id.to_string()]).expect("tag"),
+            Tag::parse(["job-request", &"01".repeat(32)]).expect("tag"),
+            Tag::parse(["job-target", &agent.public_key().to_hex()]).expect("tag"),
             Tag::parse(["h", &channel.to_string()]).expect("tag"),
-            Tag::parse(["e", &second.id.to_hex(), "", "reply"]).expect("tag"),
+            Tag::parse(["supplemental-event", &source.id.to_hex()]).expect("tag"),
+            Tag::parse(["supplemental-author", &user.public_key().to_hex()]).expect("tag"),
+            Tag::parse(["continuation-generation", "2"]).expect("tag"),
         ])
         .sign_with_keys(&agent)
         .expect("event");
-        let projected = project_supplemental_messages(
-            &[first.clone(), second.clone(), response.clone()],
-            agent.public_key(),
-            &first.id.to_hex(),
-        );
+        let parsed = parse_supplemental_admission(&admission).expect("admission");
 
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0].event_id, first.id.to_hex());
-        assert!(projected[0].response_event_id.is_none());
-        assert_eq!(projected[1].event_id, second.id.to_hex());
-        assert_eq!(projected[1].response_event_id, Some(response.id.to_hex()));
+        assert_eq!(parsed.job_id, job_id);
+        assert_eq!(parsed.channel_id, channel);
+        assert_eq!(parsed.source_event_id, source.id.to_hex());
+        assert_eq!(parsed.source_author, user.public_key().to_hex());
+        assert_eq!(parsed.continuation_generation, 2);
+        assert_eq!(parsed.content, "status?");
+
+        let unrelated = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+            "unrelated later chatter",
+        )
+        .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
+        .sign_with_keys(&user)
+        .expect("event");
+        let (messages, unanswered) = project_admitted_supplemental(
+            vec![(admission.clone(), parsed.clone())],
+            &[source.clone(), unrelated],
+            &[],
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].event_id, source.id.to_hex());
+        assert_eq!(unanswered, vec![source.clone()]);
+
+        let (messages, unanswered) =
+            project_admitted_supplemental(vec![(admission, parsed)], &[], &[]);
         assert_eq!(
-            projected[1].response_content.as_deref(),
-            Some("Checkpoint retained; tracked continuation remains.")
+            messages.len(),
+            1,
+            "durable content survives source deletion"
+        );
+        assert!(
+            unanswered.is_empty(),
+            "optional reply is skipped, not gated"
         );
     }
 

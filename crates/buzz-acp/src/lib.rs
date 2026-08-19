@@ -2649,11 +2649,11 @@ async fn tokio_main() -> Result<()> {
                 }
                 _ = job_reconciliation.tick() => {
                     let _ = result_rx;
-                    let deferred_jobs = queue.outstanding_followup_job_ids();
+                    let deferred_channels = queue.channels_blocking_new_job_claims();
                     match job_execution::reconcile(
                         &ctx.rest_client,
                         &queued_job_attempts,
-                        &deferred_jobs,
+                        &deferred_channels,
                         config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
                     ).await {
                         Ok(snapshot) => {
@@ -2904,6 +2904,17 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            if kind_u32 == buzz_core::kind::KIND_STREAM_MESSAGE
+                                && buzz_event.event.pubkey.to_hex() == pubkey_hex
+                                && queue.record_job_followup_response(&buzz_event.event)
+                            {
+                                tracing::info!(
+                                    response_event_id = %buzz_event.event.id,
+                                    channel_id = %buzz_event.channel_id,
+                                    "attached durable restricted follow-up response to queued continuation"
+                                );
+                            }
+
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
@@ -3127,6 +3138,54 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                             };
+                            // The author gate and subscription rule above are
+                            // the admission boundary. If an accepted job owns
+                            // this channel, attest the exact supplemental event
+                            // before it can steer, cancel, or enter a session.
+                            // A failed attestation is fail-closed: the active
+                            // execution is left untouched and no untracked
+                            // replacement receives the message.
+                            if let Some(guard) =
+                                queue.accepted_job_guard(buzz_event.channel_id).cloned()
+                            {
+                                let continuation_generation = queue
+                                    .supplemental_target_generation(buzz_event.channel_id)
+                                    .or_else(|| {
+                                        active_job_execution_for_channel(
+                                            &pool,
+                                            buzz_event.channel_id,
+                                        )
+                                        .map(|execution| execution.generation.saturating_add(1))
+                                    })
+                                    .unwrap_or_else(|| {
+                                        guard.last_execution.as_ref().map_or(1, |execution| {
+                                            execution.generation.saturating_add(1)
+                                        })
+                                    });
+                                match job_execution::persist_supplemental_admission(
+                                    &ctx.rest_client,
+                                    &guard,
+                                    &buzz_event.event,
+                                    continuation_generation,
+                                )
+                                .await
+                                {
+                                    Ok(admission) => tracing::info!(
+                                        job_id = %guard.job_id,
+                                        source_event_id = %buzz_event.event.id,
+                                        admission_event_id = %admission.id,
+                                        "durably admitted accepted-job supplemental context"
+                                    ),
+                                    Err(error) => {
+                                        tracing::error!(
+                                            job_id = %guard.job_id,
+                                            source_event_id = %buzz_event.event.id,
+                                            "dropping accepted-job supplemental event because durable admission failed: {error}"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
@@ -4138,19 +4197,23 @@ async fn persist_job_followup_boundary(
     }
 }
 
-/// Stop exactly the proposal turn that produced a durable accept/reject event.
-/// Ordinary work in the same channel is deliberately unaffected.
+/// Stop the channel turn that exists when a durable decision arrives. The
+/// matching evaluation is marked decided; an unrelated ordinary turn is also
+/// rotated before an accepted job may be claimed, closing stale base-session
+/// mutation authority.
 fn signal_job_evaluation_boundary(
     pool: &mut AgentPool,
     evaluation: &job_execution::JobEvaluationContext,
 ) -> bool {
-    let entry = pool
-        .task_map_mut()
-        .values_mut()
-        .find(|meta| meta.job_evaluation.as_ref() == Some(evaluation));
+    let entry = pool.task_map_mut().values_mut().find(|meta| {
+        meta.job_evaluation.as_ref() == Some(evaluation)
+            || meta.channel_id == Some(evaluation.channel_id)
+    });
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            meta.job_evaluation_decided = true;
+            if meta.job_evaluation.as_ref() == Some(evaluation) {
+                meta.job_evaluation_decided = true;
+            }
             let _ = tx.send(ControlSignal::Rotate);
             return true;
         }
@@ -4355,6 +4418,24 @@ fn enqueue_job_continuations(
             tracing::warn!(%attempt_id, "dropping continuation with malformed request root");
             continue;
         };
+        let followup = job_execution::JobFollowupContext {
+            job_id: continuation.execution.job_id,
+            request_event_id: continuation.execution.request_event_id.clone(),
+            interrupted_attempt_id: None,
+            interrupted_generation: continuation.execution.generation.checked_sub(1),
+            interrupted_turn_id: None,
+        };
+        let followup_tag = job_execution::followup_prompt_tag(&followup);
+        if let Ok(followup_tag) = followup_tag {
+            for event in &continuation.unanswered_supplemental_events {
+                queue.push(QueuedEvent {
+                    channel_id,
+                    event: event.clone(),
+                    received_at: std::time::Instant::now(),
+                    prompt_tag: followup_tag.clone(),
+                });
+            }
+        }
         queue.push_durable_continuation(QueuedEvent {
             channel_id,
             event: continuation.request,
@@ -6112,7 +6193,7 @@ mod owner_control_command_tests {
     }
 
     #[tokio::test]
-    async fn job_decision_cancels_only_the_matching_evaluation_turn() {
+    async fn accepted_job_rotates_a_stale_same_channel_turn_before_claim() {
         let mut pool = AgentPool::from_slots(vec![]);
         let channel_id = Uuid::new_v4();
         let evaluation = job_execution::JobEvaluationContext {
@@ -6141,9 +6222,12 @@ mod owner_control_command_tests {
 
         let mut wrong = evaluation.clone();
         wrong.job_id = Uuid::new_v4();
-        assert!(!signal_job_evaluation_boundary(&mut pool, &wrong));
-        assert!(signal_job_evaluation_boundary(&mut pool, &evaluation));
+        assert!(signal_job_evaluation_boundary(&mut pool, &wrong));
         assert_eq!(control_rx.await.unwrap(), ControlSignal::Rotate);
+        assert!(pool
+            .task_map()
+            .values()
+            .all(|meta| !meta.job_evaluation_decided));
         assert!(!signal_job_evaluation_boundary(&mut pool, &evaluation));
     }
 
