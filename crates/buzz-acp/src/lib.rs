@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod job_execution;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -2224,6 +2225,23 @@ async fn tokio_main() -> Result<()> {
         relay_url: config.relay_url.clone(),
     });
 
+    let mut queued_job_attempts = HashSet::new();
+    match job_execution::reconcile(
+        &ctx.rest_client,
+        &queued_job_attempts,
+        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+    )
+    .await
+    {
+        Ok(work) => enqueue_job_continuations(&mut queue, &mut queued_job_attempts, work),
+        Err(error) => tracing::warn!("initial delegated-job reconciliation failed: {error}"),
+    }
+
+    let mut job_reconciliation = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
+
     if !config.memory_enabled {
         tracing::info!(
             target: "engram::core",
@@ -2621,6 +2639,27 @@ async fn tokio_main() -> Result<()> {
                             relay_observer_control_rx = None;
                             tracing::warn!("relay observer control channel closed");
                         }
+                    }
+                    None
+                }
+                _ = job_reconciliation.tick() => {
+                    let _ = result_rx;
+                    match job_execution::reconcile(
+                        &ctx.rest_client,
+                        &queued_job_attempts,
+                        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                    ).await {
+                        Ok(work) => {
+                            enqueue_job_continuations(&mut queue, &mut queued_job_attempts, work);
+                            if pool_ready {
+                                for (channel_id, thread_tags) in
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                {
+                                    typing_channels.insert(channel_id, thread_tags);
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!("delegated-job reconciliation failed: {error}"),
                     }
                     None
                 }
@@ -3213,6 +3252,15 @@ async fn tokio_main() -> Result<()> {
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
+                if let Some(attempt_id) = pool
+                    .task_map()
+                    .values()
+                    .find(|meta| meta.agent_index == result.agent.index)
+                    .and_then(|meta| meta.job_execution.as_ref())
+                    .map(|execution| execution.attempt_id)
+                {
+                    queued_job_attempts.remove(&attempt_id);
+                }
                 // Stop typing indicator for the completed channel.
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
@@ -3255,6 +3303,30 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
+                if let Some(meta) = pool.task_map().get(&join_error.id()) {
+                    if let (Some(execution), Some(channel_id)) =
+                        (meta.job_execution.clone(), meta.channel_id)
+                    {
+                        queued_job_attempts.remove(&execution.attempt_id);
+                        let rest = ctx.rest_client.clone();
+                        let turn_id = meta.turn_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = job_execution::finish(
+                                &rest,
+                                &execution,
+                                channel_id,
+                                &turn_id,
+                                &execution.claim_event_id,
+                                "worker_loss",
+                                "prompt task panicked",
+                            )
+                            .await
+                            {
+                                tracing::warn!(job_id=%execution.job_id, attempt_id=%execution.attempt_id, "failed to record panicked attempt: {error}");
+                            }
+                        });
+                    }
+                }
                 tracing::error!("agent task panicked: {join_error}");
                 recover_panicked_agent(
                     &mut pool,
@@ -3871,6 +3943,35 @@ fn try_native_steer(
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
 /// Flush queued work to available agents.
+fn enqueue_job_continuations(
+    queue: &mut EventQueue,
+    queued_attempts: &mut HashSet<Uuid>,
+    work: Vec<job_execution::ContinuationWork>,
+) {
+    for continuation in work {
+        let attempt_id = continuation.execution.attempt_id;
+        let channel_id = buzz_core::delegated_job::parse_job_request(&continuation.request)
+            .map(|request| request.channel_id);
+        let Ok(channel_id) = channel_id else {
+            tracing::warn!(%attempt_id, "dropping continuation with malformed request root");
+            continue;
+        };
+        queue.push_durable_continuation(QueuedEvent {
+            channel_id,
+            event: continuation.request,
+            received_at: std::time::Instant::now(),
+            prompt_tag: match job_execution::prompt_tag(&continuation.execution) {
+                Ok(tag) => tag,
+                Err(error) => {
+                    tracing::warn!(%attempt_id, "failed to encode continuation metadata: {error}");
+                    continue;
+                }
+            },
+        });
+        queued_attempts.insert(attempt_id);
+    }
+}
+
 fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -3884,6 +3985,14 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        if batch.events.iter().any(|event| {
+            job_execution::from_prompt_tag(&event.prompt_tag)
+                .is_some_and(|execution| execution.lease_until <= chrono::Utc::now().timestamp())
+        }) {
+            tracing::warn!(%channel_id, "dropping queued delegated-job attempt after its durable claim lease expired");
+            queue.mark_complete(channel_id);
+            continue;
+        }
         let typing_scope = batch
             .events
             .last()
@@ -3927,7 +4036,14 @@ fn dispatch_pending(
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
-        let turn_id = Uuid::new_v4().to_string();
+        let job_execution = batch
+            .events
+            .iter()
+            .find_map(|event| job_execution::from_prompt_tag(&event.prompt_tag));
+        let turn_id = job_execution
+            .as_ref()
+            .map(|execution| execution.turn_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let task_turn_id = turn_id.clone();
 
         let abort_handle = pool.join_set.spawn(async move {
@@ -3949,6 +4065,7 @@ fn dispatch_pending(
                 agent_index,
                 channel_id: Some(channel_id),
                 turn_id,
+                job_execution,
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
@@ -4040,6 +4157,11 @@ fn handle_prompt_result(
         .find(|meta| meta.agent_index == agent_index)
         .map(|meta| meta.successful_steer_deliveries.clone())
         .unwrap_or_default();
+    let job_execution = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .and_then(|meta| meta.job_execution.clone());
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -4074,9 +4196,18 @@ fn handle_prompt_result(
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
     if let Some(batch) = result.batch.take() {
+        let is_job_attempt = batch
+            .events
+            .iter()
+            .any(|event| job_execution::from_prompt_tag(&event.prompt_tag).is_some());
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
-        if !removed_channels.contains(&batch.channel_id) {
+        if is_job_attempt {
+            tracing::info!(
+                channel_id = %batch.channel_id,
+                "job attempt ended; durable reconciliation owns continuation"
+            );
+        } else if !removed_channels.contains(&batch.channel_id) {
             if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
@@ -4217,6 +4348,27 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
+    if let (Some(execution), Some(channel_id), Some(rest_client)) =
+        (job_execution, channel_id, rest_client.cloned())
+    {
+        let outcome = outcome_label.to_string();
+        let turn_id = turn_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = job_execution::finish(
+                &rest_client,
+                &execution,
+                channel_id,
+                &turn_id,
+                &execution.claim_event_id,
+                &outcome,
+                "",
+            )
+            .await
+            {
+                tracing::warn!(job_id=%execution.job_id, attempt_id=%execution.attempt_id, "failed to record execution-attempt outcome: {error}");
+            }
+        });
+    }
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
             let mut payload = serde_json::json!({
@@ -4585,6 +4737,7 @@ fn dispatch_heartbeat(
             agent_index,
             channel_id: None,
             turn_id,
+            job_execution: None,
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5384,6 +5537,7 @@ mod owner_control_command_tests {
                 agent_index: 0,
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -7510,6 +7664,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7582,6 +7737,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7697,6 +7853,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: Some(channel_id),
                 turn_id: "test-turn-id".into(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7762,6 +7919,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7839,6 +7997,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: Some(channel_id),
                 turn_id: "panic-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7932,6 +8091,7 @@ mod error_outcome_emission_tests {
                     agent_index: 0,
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
+                    job_execution: None,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8024,6 +8184,7 @@ mod error_outcome_emission_tests {
                     agent_index: 0,
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
+                    job_execution: None,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8130,6 +8291,7 @@ mod error_outcome_emission_tests {
                     agent_index: 0,
                     channel_id: None,
                     turn_id: "test-turn-id".to_string(),
+                    job_execution: None,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8207,6 +8369,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8302,6 +8465,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8419,6 +8583,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8559,6 +8724,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8748,6 +8914,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8834,6 +9001,7 @@ mod error_outcome_emission_tests {
                 agent_index: 0,
                 channel_id: None,
                 turn_id: "test-turn-id".to_string(),
+                job_execution: None,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,

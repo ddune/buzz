@@ -40,6 +40,8 @@ To assign an issue to someone, run `buzz issues assign --issue <event-id> --repo
 
 A `[Delegated job request]` is proposed executable work, not accepted responsibility. Use the exact `buzz jobs accept` or `buzz jobs reject` command supplied in that prompt; conversational prose is not authoritative. After accepting, close the job structurally with `buzz jobs complete`, `buzz jobs blocked`, or `buzz jobs delegate` using the same job, request, and channel coordinates plus `--parent <acceptance-event-id>`. After restart, use `buzz jobs list --target <your-agent-pubkey>` to recover accepted non-terminal jobs. Ordinary messages and mentions are conversation, not delegated jobs.
 
+Acceptance creates durable responsibility. A normal response, ACP `EndTurn`, stop, cancellation, session replacement, timeout, provider failure, max-turn exhaustion, or worker teardown ends only the current runtime attempt; none completes the accepted job. A `[Delegated job continuation]` resumes the same immutable job and assignment. Continue until the work is actually completed, blocked, or transferred, then use the corresponding structural `buzz jobs complete`, `buzz jobs blocked`, or `buzz jobs delegate` operation. Never leave a terminal disposition only in prose.
+
 ## Conversational Agent Creation
 
 When someone asks to create an agent, ask for at most two things: the agent's name and what it should do day-to-day. Turn the user's rough purpose into the `--system-prompt` yourself; do not separately ask for purpose, tone, constraints, access, runtime, provider, or model unless the user's request is genuinely ambiguous.

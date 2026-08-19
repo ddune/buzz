@@ -36,7 +36,7 @@ const BASE_RETRY_DELAY_SECS: u64 = 5;
 const MAX_RETRY_DELAY_SECS: u64 = 300;
 
 /// Buffer added to `max_turn_duration` to derive the in-flight deadline.
-const IN_FLIGHT_DEADLINE_BUFFER_SECS: u64 = 100;
+pub(crate) const IN_FLIGHT_DEADLINE_BUFFER_SECS: u64 = 100;
 
 /// Default in-flight deadline: default max_turn (7200s) + 100s buffer.
 const DEFAULT_IN_FLIGHT_DEADLINE_SECS: u64 = 7300;
@@ -251,6 +251,21 @@ impl EventQueue {
         true
     }
 
+    /// Enqueue a durably claimed delegated-job continuation without applying
+    /// conversational drop mode or eviction. Once the relay accepts a claim,
+    /// local queue pressure must not orphan it until a multi-hour lease expiry.
+    pub fn push_durable_continuation(&mut self, event: QueuedEvent) {
+        let queue = self.queues.entry(event.channel_id).or_default();
+        if queue.len() >= MAX_PENDING_PER_CHANNEL {
+            tracing::warn!(
+                channel_id = %event.channel_id,
+                limit = MAX_PENDING_PER_CHANNEL,
+                "queue depth cap reached — retaining durable job continuation beyond ordinary cap"
+            );
+        }
+        queue.push_back(event);
+    }
+
     /// Try to flush the next batch.
     ///
     /// Returns `None` if all non-in-flight, non-throttled queues are empty.
@@ -338,16 +353,25 @@ impl EventQueue {
         // conversational events. This keeps job acceptance decisions out of
         // generic message dispatch while preserving the existing queue.
         let head_is_job = queue.front().is_some_and(|event| {
-            event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST
+            crate::job_execution::from_prompt_tag(&event.prompt_tag).is_some()
+                || event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST
         });
-        let same_class = queue
-            .iter()
-            .take_while(|event| {
-                (event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST)
-                    == head_is_job
-            })
-            .count();
-        let drain_count = MAX_BATCH_EVENTS.min(same_class);
+        // A job proposal or continuation is one obligation boundary. Never
+        // combine two jobs, or a proposal and an accepted continuation, into
+        // one turn: TaskMeta intentionally carries exactly one attempt.
+        let drain_count = if head_is_job {
+            1
+        } else {
+            MAX_BATCH_EVENTS.min(
+                queue
+                    .iter()
+                    .take_while(|event| {
+                        crate::job_execution::from_prompt_tag(&event.prompt_tag).is_none()
+                            && event.event.kind.as_u16() as u32 != buzz_core::kind::KIND_JOB_REQUEST
+                    })
+                    .count(),
+            )
+        };
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -1601,6 +1625,30 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     if batch
         .events
         .iter()
+        .all(|event| crate::job_execution::from_prompt_tag(&event.prompt_tag).is_some())
+    {
+        let mut orientation = String::from(
+            "[Delegated job continuation]\nThis resumes an existing accepted delegated job. It is not a new assignment. Recover the existing repository, worktree, and checkpoints and continue until the job is structurally completed, blocked, or delegated/transferred.",
+        );
+        for event in &batch.events {
+            if let (Some(execution), Ok(job)) = (
+                crate::job_execution::from_prompt_tag(&event.prompt_tag),
+                buzz_core::delegated_job::parse_job_request(&event.event),
+            ) {
+                orientation.push_str(&format!(
+                    "\n\nJob/obligation: {}\nAttempt: {}\nContinuation generation: {}\nOriginating channel: {}\nOriginal assignment:\n{}\n\nNormal turn completion does not close this job. Use `buzz jobs complete`, `buzz jobs blocked`, or `buzz jobs delegate` for the authoritative disposition.",
+                    execution.job_id,
+                    execution.attempt_id,
+                    execution.generation,
+                    job.channel_id,
+                    job.assignment,
+                ));
+            }
+        }
+        sections.push(orientation);
+    } else if batch
+        .events
+        .iter()
         .all(|event| event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_JOB_REQUEST)
     {
         let mut orientation = String::from(
@@ -1858,6 +1906,23 @@ mod tests {
         }
     }
 
+    fn make_continuation_queued(channel_id: Uuid, content: &str, generation: i64) -> QueuedEvent {
+        let mut event = make_job_queued(channel_id, content);
+        let request = buzz_core::delegated_job::parse_job_request(&event.event).expect("request");
+        let execution = crate::job_execution::JobExecutionContext {
+            job_id: request.job_id,
+            request_event_id: request.request_event_id,
+            attempt_id: Uuid::new_v4(),
+            generation,
+            runnable_event_id: "ab".repeat(32),
+            claim_event_id: "cd".repeat(32),
+            turn_id: format!("turn-{generation}"),
+            lease_until: i64::MAX,
+        };
+        event.prompt_tag = crate::job_execution::prompt_tag(&execution).expect("prompt tag");
+        event
+    }
+
     /// Build a QueuedEvent with a specific `received_at` offset from now.
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
@@ -1917,6 +1982,133 @@ mod tests {
     }
 
     #[test]
+    fn accepted_continuation_and_supplementary_conversation_stay_separate() {
+        let channel = Uuid::new_v4();
+        let mut continuation = make_job_queued(channel, "immutable assignment root");
+        let request =
+            buzz_core::delegated_job::parse_job_request(&continuation.event).expect("request");
+        let execution = crate::job_execution::JobExecutionContext {
+            job_id: request.job_id,
+            request_event_id: request.request_event_id,
+            attempt_id: Uuid::new_v4(),
+            generation: 3,
+            runnable_event_id: "ab".repeat(32),
+            claim_event_id: "cd".repeat(32),
+            turn_id: "turn-3".into(),
+            lease_until: i64::MAX,
+        };
+        continuation.prompt_tag = crate::job_execution::prompt_tag(&execution).expect("prompt tag");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(continuation));
+        assert!(queue.push(make_queued(channel, "supplementary direction")));
+
+        let first = queue.flush_next().expect("continuation batch");
+        assert_eq!(first.events.len(), 1);
+        let recovered = crate::job_execution::from_prompt_tag(&first.events[0].prompt_tag)
+            .expect("continuation context");
+        assert_eq!(recovered.job_id, execution.job_id);
+        assert_eq!(recovered.generation, 3);
+        queue.mark_complete(channel);
+
+        let second = queue.flush_next().expect("conversation batch");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event.kind, Kind::Custom(9));
+        assert!(crate::job_execution::from_prompt_tag(&second.events[0].prompt_tag).is_none());
+    }
+
+    #[test]
+    fn each_job_proposal_and_continuation_gets_its_own_runtime_batch() {
+        let channel = Uuid::new_v4();
+        let first = make_continuation_queued(channel, "accepted job one", 1);
+        let first_context = crate::job_execution::from_prompt_tag(&first.prompt_tag).unwrap();
+        let proposal = make_job_queued(channel, "new unaccepted proposal");
+        let second = make_continuation_queued(channel, "accepted job two", 4);
+        let second_context = crate::job_execution::from_prompt_tag(&second.prompt_tag).unwrap();
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(first));
+        assert!(queue.push(proposal));
+        assert!(queue.push(second));
+
+        let batch = queue.flush_next().expect("first continuation");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            crate::job_execution::from_prompt_tag(&batch.events[0].prompt_tag)
+                .map(|context| context.job_id),
+            Some(first_context.job_id)
+        );
+        queue.mark_complete(channel);
+
+        let batch = queue.flush_next().expect("proposal");
+        assert_eq!(batch.events.len(), 1);
+        assert!(crate::job_execution::from_prompt_tag(&batch.events[0].prompt_tag).is_none());
+        assert_eq!(
+            batch.events[0].event.kind,
+            Kind::Custom(buzz_core::kind::KIND_JOB_REQUEST as u16)
+        );
+        queue.mark_complete(channel);
+
+        let batch = queue.flush_next().expect("second continuation");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            crate::job_execution::from_prompt_tag(&batch.events[0].prompt_tag)
+                .map(|context| context.job_id),
+            Some(second_context.job_id)
+        );
+    }
+
+    #[test]
+    fn durable_continuation_survives_drop_mode_and_queue_saturation() {
+        let channel = Uuid::new_v4();
+        let mut drop_queue = EventQueue::new(DedupMode::Drop);
+        assert!(drop_queue.push(make_queued(channel, "active conversation")));
+        let active = drop_queue.flush_next().expect("in-flight conversation");
+        let continuation = make_continuation_queued(channel, "durable accepted job", 1);
+        drop_queue.push_durable_continuation(continuation);
+        assert_eq!(pending_count(&drop_queue), 1);
+        drop_queue.mark_complete(channel);
+        let recovered = drop_queue.flush_next().expect("durable continuation");
+        assert!(crate::job_execution::from_prompt_tag(&recovered.events[0].prompt_tag).is_some());
+        assert_eq!(active.events.len(), 1);
+
+        let saturated_channel = Uuid::new_v4();
+        let mut saturated = EventQueue::new(DedupMode::Queue);
+        for index in 0..MAX_PENDING_PER_CHANNEL {
+            assert!(saturated.push(make_queued(saturated_channel, &format!("ordinary-{index}"),)));
+        }
+        let oldest_id = saturated.queues[&saturated_channel]
+            .front()
+            .expect("oldest")
+            .event
+            .id;
+        saturated.push_durable_continuation(make_continuation_queued(
+            saturated_channel,
+            "durable beyond cap",
+            2,
+        ));
+        assert_eq!(
+            saturated.queues[&saturated_channel].len(),
+            MAX_PENDING_PER_CHANNEL + 1
+        );
+        assert_eq!(
+            saturated.queues[&saturated_channel]
+                .front()
+                .expect("oldest retained")
+                .event
+                .id,
+            oldest_id
+        );
+        assert!(crate::job_execution::from_prompt_tag(
+            &saturated.queues[&saturated_channel]
+                .back()
+                .expect("durable tail")
+                .prompt_tag
+        )
+        .is_some());
+    }
+
+    #[test]
     fn delegated_job_prompt_requires_structural_accept_or_reject() {
         let channel = Uuid::new_v4();
         let event = make_job_queued(channel, "bounded assignment");
@@ -1934,6 +2126,41 @@ mod tests {
         assert!(prompt.contains("proposed delegation, not accepted work"));
         assert!(prompt.contains("buzz jobs accept"));
         assert!(prompt.contains("buzz jobs reject"));
+    }
+
+    #[test]
+    fn accepted_job_continuation_preserves_identity_and_requires_structural_disposition() {
+        let channel = Uuid::new_v4();
+        let mut event = make_job_queued(channel, "immutable assignment root");
+        let request = buzz_core::delegated_job::parse_job_request(&event.event).expect("request");
+        let execution = crate::job_execution::JobExecutionContext {
+            job_id: request.job_id,
+            request_event_id: request.request_event_id,
+            attempt_id: Uuid::new_v4(),
+            generation: 2,
+            runnable_event_id: "ab".repeat(32),
+            claim_event_id: "cd".repeat(32),
+            turn_id: "turn-2".into(),
+            lease_until: i64::MAX,
+        };
+        event.prompt_tag = crate::job_execution::prompt_tag(&execution).expect("prompt tag");
+        let batch = FlushBatch {
+            channel_id: channel,
+            events: vec![BatchEvent {
+                event: event.event,
+                prompt_tag: event.prompt_tag,
+                received_at: event.received_at,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        assert!(prompt.contains("not a new assignment"));
+        assert!(prompt.contains(&execution.job_id.to_string()));
+        assert!(prompt.contains("Continuation generation: 2"));
+        assert!(prompt.contains("immutable assignment root"));
+        assert!(prompt.contains("Normal turn completion does not close this job"));
+        assert!(prompt.contains("buzz jobs complete"));
     }
 
     #[test]

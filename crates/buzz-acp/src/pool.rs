@@ -61,6 +61,8 @@ pub struct TaskMeta {
     pub channel_id: Option<Uuid>,
     /// Identifies terminal events when the task panics before returning a result.
     pub turn_id: String,
+    /// Accepted-job attempt bound to this runtime turn, when job-class work.
+    pub job_execution: Option<crate::job_execution::JobExecutionContext>,
     /// Clone of batch for Queue mode panic recovery.
     pub recoverable_batch: Option<FlushBatch>,
     /// Control signal for the in-flight prompt task.

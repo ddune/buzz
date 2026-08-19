@@ -22,20 +22,21 @@ use buzz_core::kind::{
     KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
     KIND_IA_UNARCHIVE_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED,
-    KIND_JOB_DELEGATED, KIND_JOB_REJECTED, KIND_JOB_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
-    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
-    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
-    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
-    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
-    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
-    KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE,
-    KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
-    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
-    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
-    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS,
-    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
-    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_JOB_DELEGATED, KIND_JOB_EXECUTION_ATTEMPT, KIND_JOB_REJECTED, KIND_JOB_REQUEST,
+    KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
+    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
+    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
+    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
+    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
+    KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT, KIND_REACTION,
+    KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
+    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
+    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
+    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
+    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -396,7 +397,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_JOB_REJECTED
         | KIND_JOB_COMPLETED
         | KIND_JOB_BLOCKED
-        | KIND_JOB_DELEGATED => Ok(Scope::MessagesWrite),
+        | KIND_JOB_DELEGATED
+        | KIND_JOB_EXECUTION_ATTEMPT => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
@@ -637,6 +639,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_JOB_COMPLETED
             | KIND_JOB_BLOCKED
             | KIND_JOB_DELEGATED
+            | KIND_JOB_EXECUTION_ATTEMPT
             // NIP-29 admin kinds (except CREATE_GROUP which creates the channel)
             | KIND_NIP29_PUT_USER
             | KIND_NIP29_REMOVE_USER
@@ -2035,6 +2038,7 @@ async fn ingest_event_inner(
             | KIND_JOB_COMPLETED
             | KIND_JOB_BLOCKED
             | KIND_JOB_DELEGATED
+            | KIND_JOB_EXECUTION_ATTEMPT
     ) {
         if let Some(stored) = state
             .db
@@ -2835,6 +2839,43 @@ async fn ingest_event_inner(
         let outcome = state
             .db
             .accept_job_lifecycle(tenant.community(), &event, &lifecycle)
+            .await
+            .map_err(|error| match error {
+                buzz_db::job::JobWriteError::Rejected(reason) => {
+                    IngestError::Rejected(format!("invalid: {reason}"))
+                }
+                buzz_db::job::JobWriteError::Database(error) => {
+                    IngestError::Internal(format!("error: {error}"))
+                }
+            })?;
+        if outcome.was_inserted {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &outcome.stored_event,
+                kind_u32,
+                &event.pubkey.to_hex(),
+                threaded_visibility.clone(),
+            )
+            .await;
+        }
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: if outcome.was_inserted {
+                String::new()
+            } else {
+                "duplicate: identical event".into()
+            },
+        });
+    }
+
+    if kind_u32 == KIND_JOB_EXECUTION_ATTEMPT {
+        let attempt = buzz_core::execution_attempt::parse_execution_attempt(&event)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        let outcome = state
+            .db
+            .accept_job_execution_attempt(tenant.community(), &event, &attempt)
             .await
             .map_err(|error| match error {
                 buzz_db::job::JobWriteError::Rejected(reason) => {
