@@ -3637,6 +3637,7 @@ async fn tokio_main() -> Result<()> {
             Some(PoolEvent::Panic(join_error)) => {
                 persist_panicked_job_attempt(
                     &pool,
+                    &mut queue,
                     &ctx.rest_client,
                     &mut queued_job_attempts,
                     join_error.id(),
@@ -4516,10 +4517,23 @@ fn release_finished_job_attempt(
     finish_persisted && queued_attempts.remove(&attempt_id)
 }
 
+fn release_prefinished_job_attempt(
+    queue: &mut EventQueue,
+    queued_attempts: &mut HashSet<Uuid>,
+    attempt_id: Uuid,
+) -> bool {
+    let prefinished = queue.take_job_attempt_prefinished(attempt_id);
+    if prefinished {
+        let _ = release_finished_job_attempt(queued_attempts, attempt_id, true);
+    }
+    prefinished
+}
+
 /// Both Tokio panic ingress paths must cross the same durable finish boundary
 /// before task metadata/channel ownership is released.
 async fn persist_panicked_job_attempt(
     pool: &AgentPool,
+    queue: &mut EventQueue,
     rest: &relay::RestClient,
     queued_job_attempts: &mut HashSet<Uuid>,
     task_id: tokio::task::Id,
@@ -4533,6 +4547,14 @@ async fn persist_panicked_job_attempt(
         ))
     });
     if let Some((execution, channel_id, turn_id)) = panicked_execution {
+        if release_prefinished_job_attempt(queue, queued_job_attempts, execution.attempt_id) {
+            tracing::debug!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                "panicked attempt finish already persisted at cancel-and-merge boundary"
+            );
+            return;
+        }
         if persist_job_attempt_finish(
             rest,
             &execution,
@@ -4550,7 +4572,9 @@ async fn persist_panicked_job_attempt(
 
 #[cfg(test)]
 mod execution_authority_release_tests {
-    use super::release_finished_job_attempt;
+    use super::{release_finished_job_attempt, release_prefinished_job_attempt};
+    use crate::config::DedupMode;
+    use crate::queue::EventQueue;
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -4562,6 +4586,22 @@ mod execution_authority_release_tests {
         assert!(queued.contains(&attempt));
         assert!(release_finished_job_attempt(&mut queued, attempt, true));
         assert!(!queued.contains(&attempt));
+    }
+
+    #[test]
+    fn prefinished_cancelled_panic_consumes_marker_and_releases_guard() {
+        let attempt = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.mark_job_attempt_prefinished(attempt);
+        let mut queued = HashSet::from([attempt]);
+
+        assert!(release_prefinished_job_attempt(
+            &mut queue,
+            &mut queued,
+            attempt
+        ));
+        assert!(!queued.contains(&attempt));
+        assert!(!queue.take_job_attempt_prefinished(attempt));
     }
 }
 
@@ -5402,6 +5442,7 @@ async fn drain_ready_join_results(
             tracing::error!("agent task panicked: {join_error}");
             persist_panicked_job_attempt(
                 pool,
+                queue,
                 rest,
                 queued_job_attempts,
                 join_error.id(),
