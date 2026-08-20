@@ -1313,7 +1313,7 @@ fn mcp_servers_with_git_origin(
     channel_type: Option<&str>,
     agent_name: Option<&str>,
     capability_profile: SessionCapabilityProfile,
-    followup_reply_event_ids: &[String],
+    _followup_reply_event_ids: &[String],
 ) -> Vec<McpServer> {
     let mut servers = servers.to_vec();
     if capability_profile.strips_native_tools() {
@@ -1323,39 +1323,38 @@ fn mcp_servers_with_git_origin(
         servers.retain(|server| server.command == "buzz-dev-mcp");
         // Hermes registers ACP-provided MCP processes globally by server name
         // and intentionally treats a repeated name as an idempotent lookup.
-        // Give each fail-closed restricted process its own registry identity so
-        // a later execution session cannot reuse its environment. The
-        // executable identity remains exact and trusted; only the ACP
-        // registration name is separated from normal execution.
+        // Decision and follow-up processes have registry identities separate
+        // from normal execution. The follow-up broker is deliberately stable;
+        // per-reply authority is checked dynamically by the CLI below it.
         for server in &mut servers {
             server.name = match capability_profile {
                 SessionCapabilityProfile::JobDecision => "buzz-dev-mcp-job-decision".into(),
-                SessionCapabilityProfile::JobFollowupReadonly => {
-                    // Hermes keeps MCP registrations process-global and treats
-                    // a repeated name as an idempotent lookup. Include the
-                    // exact reply-authority batch in the registration identity
-                    // so a later follow-up cannot reuse stale environment.
-                    use sha2::{Digest, Sha256};
-                    let authority = followup_reply_event_ids.join(",");
-                    let digest = Sha256::digest(authority.as_bytes());
-                    format!("buzz-dev-mcp-job-followup-{}", hex::encode(&digest[..12]))
-                }
+                // One process-global broker is deliberately reused. Its shell
+                // surface is only the exact `buzz messages send` shape; the
+                // CLI revalidates the reply target against durable relay state
+                // on every call. This supports native steering without
+                // accumulating stale credential-bearing MCP processes.
+                SessionCapabilityProfile::JobFollowupReadonly => "buzz-dev-mcp-job-followup".into(),
                 _ => server.name.clone(),
             };
         }
     }
-    let origin = match (channel_id, channel_type) {
-        (Some(channel_id), Some("stream")) => Some(EnvVar {
+    let origin = match (capability_profile, channel_id, channel_type) {
+        // The process-global follow-up broker must not retain the channel from
+        // its first session. Every send carries an explicit channel and is
+        // authorized dynamically against the durable admission.
+        (SessionCapabilityProfile::JobFollowupReadonly, _, _) => None,
+        (_, Some(channel_id), Some("stream")) => Some(EnvVar {
             name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
             value: channel_id.to_string(),
         }),
-        (Some(_), _) => agent_name
+        (_, Some(_), _) => agent_name
             .filter(|name| !name.trim().is_empty())
             .map(|name| EnvVar {
                 name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
                 value: name.trim().to_string(),
             }),
-        (None, _) => None,
+        (_, None, _) => None,
     };
     if let Some(origin) = origin {
         for server in &mut servers {
@@ -1391,18 +1390,6 @@ fn mcp_servers_with_git_origin(
                     name: "BUZZ_JOB_FOLLOWUP_READONLY".into(),
                     value: "1".into(),
                 });
-                if let Some(channel_id) = channel_id {
-                    server.env.push(EnvVar {
-                        name: "BUZZ_JOB_FOLLOWUP_CHANNEL_ID".into(),
-                        value: channel_id.to_string(),
-                    });
-                }
-                if !followup_reply_event_ids.is_empty() {
-                    server.env.push(EnvVar {
-                        name: "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS".into(),
-                        value: followup_reply_event_ids.join(","),
-                    });
-                }
             }
             SessionCapabilityProfile::Ordinary | SessionCapabilityProfile::JobExecution => {}
         }
@@ -5025,17 +5012,17 @@ mod tests {
         );
 
         assert_eq!(servers.len(), 1);
-        assert!(servers[0].name.starts_with("buzz-dev-mcp-job-followup-"));
+        assert_eq!(servers[0].name, "buzz-dev-mcp-job-followup");
         assert!(servers[0]
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_READONLY" && entry.value == "1"));
-        assert!(servers[0].env.iter().any(|entry| {
-            entry.name == "BUZZ_JOB_FOLLOWUP_CHANNEL_ID" && entry.value == channel.to_string()
-        }));
-        assert!(servers[0].env.iter().any(|entry| {
-            entry.name == "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS" && entry.value == reply_ids.join(",")
-        }));
+        for name in [
+            "BUZZ_JOB_FOLLOWUP_CHANNEL_ID",
+            "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS",
+        ] {
+            assert!(!servers[0].env.iter().any(|entry| entry.name == name));
+        }
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(!servers[0].env.iter().any(|entry| entry.name == name));
         }
@@ -5048,10 +5035,15 @@ mod tests {
             SessionCapabilityProfile::JobFollowupReadonly,
             &["ef".repeat(32)],
         );
-        assert_ne!(servers[0].name, later[0].name);
-        assert!(later[0].env.iter().any(|entry| {
-            entry.name == "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS" && entry.value == "ef".repeat(32)
-        }));
+        assert_eq!(servers[0].name, later[0].name);
+        let env = |server: &McpServer| {
+            server
+                .env
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(env(&servers[0]), env(&later[0]));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):

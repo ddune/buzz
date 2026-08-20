@@ -1230,6 +1230,10 @@ impl EventQueue {
         self.prefinished_job_attempts.insert(attempt_id);
     }
 
+    pub fn job_attempt_is_prefinished(&self, attempt_id: Uuid) -> bool {
+        self.prefinished_job_attempts.contains(&attempt_id)
+    }
+
     pub fn take_job_attempt_prefinished(&mut self, attempt_id: Uuid) -> bool {
         self.prefinished_job_attempts.remove(&attempt_id)
     }

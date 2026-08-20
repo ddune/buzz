@@ -246,7 +246,7 @@ pub async fn accept_supplemental_context(
     let source_id = hex::decode(&supplemental.source_event_id).unwrap_or_default();
     let source_author = hex::decode(&supplemental.source_author).unwrap_or_default();
     let source = sqlx::query(
-        "SELECT channel_id,pubkey,content FROM events \
+        "SELECT kind,channel_id,pubkey,content FROM events \
          WHERE community_id=$1 AND id=$2 FOR SHARE",
     )
     .bind(community.as_uuid())
@@ -255,14 +255,16 @@ pub async fn accept_supplemental_context(
     .await?
     .ok_or_else(|| JobWriteError::Rejected("unknown supplemental source event".into()))?;
     let source_channel: Option<Uuid> = source.try_get("channel_id")?;
+    let source_kind: i32 = source.try_get("kind")?;
     let stored_author: Vec<u8> = source.try_get("pubkey")?;
     let stored_content: String = source.try_get("content")?;
-    if source_channel != Some(supplemental.channel_id)
+    if source_kind != buzz_core::kind::KIND_STREAM_MESSAGE as i32
+        || source_channel != Some(supplemental.channel_id)
         || stored_author != source_author
         || stored_content != supplemental.content
     {
         return Err(JobWriteError::Rejected(
-            "supplemental source event channel, author, or content mismatch".into(),
+            "supplemental source event kind, channel, author, or content mismatch".into(),
         ));
     }
 
@@ -804,19 +806,25 @@ mod tests {
             .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
             .sign_with_keys(&source_author)
             .expect("source");
+        let wrong_kind_source = EventBuilder::new(Kind::TextNote, "status?")
+            .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
+            .sign_with_keys(&source_author)
+            .expect("wrong-kind source");
         let mut tx = pool.begin().await.expect("source transaction");
-        insert_event(
-            &mut tx,
-            community,
-            &source,
-            channel,
-            event_timestamp(&source).expect("timestamp"),
-        )
-        .await
-        .expect("source insert");
+        for event in [&source, &wrong_kind_source] {
+            insert_event(
+                &mut tx,
+                community,
+                event,
+                channel,
+                event_timestamp(event).expect("timestamp"),
+            )
+            .await
+            .expect("source insert");
+        }
         tx.commit().await.expect("source commit");
 
-        let supplemental = |author_hex: String| {
+        let supplemental = |source: &Event, author_hex: String| {
             EventBuilder::new(
                 Kind::Custom(buzz_core::kind::KIND_JOB_SUPPLEMENTAL_CONTEXT as u16),
                 serde_json::json!({"content":"status?"}).to_string(),
@@ -834,7 +842,7 @@ mod tests {
             .expect("supplemental")
         };
 
-        let wrong = supplemental(Keys::generate().public_key().to_hex());
+        let wrong = supplemental(&source, Keys::generate().public_key().to_hex());
         let wrong_parsed = buzz_core::supplemental_context::parse_supplemental_context(&wrong)
             .expect("structural parse");
         assert!(matches!(
@@ -842,7 +850,16 @@ mod tests {
             Err(JobWriteError::Rejected(_))
         ));
 
-        let valid = supplemental(source_author.public_key().to_hex());
+        let wrong_kind = supplemental(&wrong_kind_source, source_author.public_key().to_hex());
+        let wrong_kind_parsed =
+            buzz_core::supplemental_context::parse_supplemental_context(&wrong_kind)
+                .expect("wrong kind source has structurally valid admission");
+        assert!(matches!(
+            accept_supplemental_context(&pool, community, &wrong_kind, &wrong_kind_parsed).await,
+            Err(JobWriteError::Rejected(_))
+        ));
+
+        let valid = supplemental(&source, source_author.public_key().to_hex());
         let valid_parsed = buzz_core::supplemental_context::parse_supplemental_context(&valid)
             .expect("valid parse");
         assert!(

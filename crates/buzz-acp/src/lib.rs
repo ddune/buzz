@@ -3485,14 +3485,42 @@ async fn tokio_main() -> Result<()> {
                             )
                         })
                     });
-                if let Some(attempt_id) = pool
+                let completed_execution = pool
                     .task_map()
                     .values()
                     .find(|meta| meta.agent_index == result.agent.index)
-                    .and_then(|meta| meta.job_execution.as_ref())
-                    .map(|execution| execution.attempt_id)
-                {
-                    queued_job_attempts.remove(&attempt_id);
+                    .and_then(|meta| {
+                        Some((
+                            meta.job_execution.clone()?,
+                            meta.channel_id?,
+                            meta.turn_id.clone(),
+                        ))
+                    });
+                if let Some((execution, channel_id, turn_id)) = completed_execution {
+                    let persisted = if queue.job_attempt_is_prefinished(execution.attempt_id) {
+                        true
+                    } else {
+                        persist_job_attempt_finish(
+                            &ctx.rest_client,
+                            &execution,
+                            channel_id,
+                            &turn_id,
+                            prompt_outcome_label(&result.outcome),
+                            "",
+                        )
+                        .await
+                    };
+                    if persisted {
+                        // handle_prompt_result consumes this marker instead of
+                        // issuing another finish. Only now may reconciliation
+                        // stop treating the old claim as locally owned.
+                        queue.mark_job_attempt_prefinished(execution.attempt_id);
+                        release_finished_job_attempt(
+                            &mut queued_job_attempts,
+                            execution.attempt_id,
+                            true,
+                        );
+                    }
                 }
                 // Stop typing indicator for the completed channel.
                 if let PromptSource::Channel(ch) = &result.source {
@@ -3600,24 +3628,23 @@ async fn tokio_main() -> Result<()> {
                     if let (Some(execution), Some(channel_id)) =
                         (meta.job_execution.clone(), meta.channel_id)
                     {
-                        queued_job_attempts.remove(&execution.attempt_id);
-                        let rest = ctx.rest_client.clone();
                         let turn_id = meta.turn_id.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = job_execution::finish(
-                                &rest,
-                                &execution,
-                                channel_id,
-                                &turn_id,
-                                &execution.claim_event_id,
-                                "worker_loss",
-                                "prompt task panicked",
-                            )
-                            .await
-                            {
-                                tracing::warn!(job_id=%execution.job_id, attempt_id=%execution.attempt_id, "failed to record panicked attempt: {error}");
-                            }
-                        });
+                        if persist_job_attempt_finish(
+                            &ctx.rest_client,
+                            &execution,
+                            channel_id,
+                            &turn_id,
+                            "worker_loss",
+                            "prompt task panicked",
+                        )
+                        .await
+                        {
+                            release_finished_job_attempt(
+                                &mut queued_job_attempts,
+                                execution.attempt_id,
+                                true,
+                            );
+                        }
                     }
                 }
                 tracing::error!("agent task panicked: {join_error}");
@@ -4437,6 +4464,91 @@ async fn promote_accepted_job(
     );
 }
 
+/// Persist the attempt boundary before releasing local claim ownership.
+/// Bounded retries cover short relay visibility/network faults; if all fail,
+/// the in-memory queued-attempt guard remains armed and reconciliation cannot
+/// recover/redispatch the still-active claim in this process.
+async fn persist_job_attempt_finish(
+    rest: &relay::RestClient,
+    execution: &job_execution::JobExecutionContext,
+    channel_id: Uuid,
+    turn_id: &str,
+    outcome: &str,
+    detail: &str,
+) -> bool {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match job_execution::finish(
+            rest,
+            execution,
+            channel_id,
+            turn_id,
+            &execution.claim_event_id,
+            outcome,
+            detail,
+        )
+        .await
+        {
+            Ok(()) => return true,
+            Err(error) if attempt < ATTEMPTS => {
+                tracing::warn!(
+                    job_id = %execution.job_id,
+                    attempt_id = %execution.attempt_id,
+                    retry = attempt,
+                    "attempt finish not yet durable; retaining local claim guard: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(50_u64 << (attempt - 1))).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id = %execution.job_id,
+                    attempt_id = %execution.attempt_id,
+                    "attempt finish could not be persisted; local claim guard remains armed: {error}"
+                );
+                return false;
+            }
+        }
+    }
+    false
+}
+
+fn release_finished_job_attempt(
+    queued_attempts: &mut HashSet<Uuid>,
+    attempt_id: Uuid,
+    finish_persisted: bool,
+) -> bool {
+    finish_persisted && queued_attempts.remove(&attempt_id)
+}
+
+#[cfg(test)]
+mod execution_authority_release_tests {
+    use super::release_finished_job_attempt;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn local_claim_guard_releases_only_after_durable_finish() {
+        let attempt = Uuid::new_v4();
+        let mut queued = HashSet::from([attempt]);
+        assert!(!release_finished_job_attempt(&mut queued, attempt, false));
+        assert!(queued.contains(&attempt));
+        assert!(release_finished_job_attempt(&mut queued, attempt, true));
+        assert!(!queued.contains(&attempt));
+    }
+}
+
+fn prompt_outcome_label(outcome: &PromptOutcome) -> &'static str {
+    match outcome {
+        PromptOutcome::Ok(_) => "ok",
+        PromptOutcome::Error(_) => "error",
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
+        PromptOutcome::AgentExited => "exited",
+        PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
+    }
+}
+
 fn take_pending_job_promotion(
     pending: &mut HashMap<Uuid, job_execution::JobEvaluationContext>,
     evaluation: Option<job_execution::JobEvaluationContext>,
@@ -4885,15 +4997,7 @@ fn handle_prompt_result(
         result.agent.state.invalidate_channel(ch);
     }
 
-    let outcome_label = match &result.outcome {
-        PromptOutcome::Ok(_) => "ok",
-        PromptOutcome::Error(_) => "error",
-        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
-        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
-        PromptOutcome::AgentExited => "exited",
-        PromptOutcome::Cancelled => "cancelled",
-        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
-    };
+    let outcome_label = prompt_outcome_label(&result.outcome);
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
     // moved into match arms below. `desired_model` reflects the config/persona
@@ -4917,9 +5021,7 @@ fn handle_prompt_result(
     let job_attempt_prefinished = job_execution
         .as_ref()
         .is_some_and(|execution| queue.take_job_attempt_prefinished(execution.attempt_id));
-    if let (Some(execution), Some(channel_id), Some(rest_client)) =
-        (job_execution, channel_id, rest_client.cloned())
-    {
+    if let (Some(execution), Some(_channel_id)) = (job_execution, channel_id) {
         if job_attempt_prefinished {
             tracing::debug!(
                 job_id = %execution.job_id,
@@ -4927,23 +5029,11 @@ fn handle_prompt_result(
                 "execution-attempt outcome already persisted at cancel-and-merge boundary"
             );
         } else {
-            let outcome = outcome_label.to_string();
-            let turn_id = turn_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = job_execution::finish(
-                    &rest_client,
-                    &execution,
-                    channel_id,
-                    &turn_id,
-                    &execution.claim_event_id,
-                    &outcome,
-                    "",
-                )
-                .await
-                {
-                    tracing::warn!(job_id=%execution.job_id, attempt_id=%execution.attempt_id, "failed to record execution-attempt outcome: {error}");
-                }
-            });
+            tracing::error!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                "execution result reached release without a durable finish; local reconciliation guard must remain armed"
+            );
         }
     }
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
@@ -5179,6 +5269,12 @@ fn recover_panicked_agent(
                 agent = i,
                 job_id = ?job_evaluation.as_ref().map(|evaluation| evaluation.job_id),
                 "consuming decided delegated-job evaluation after panic"
+            );
+        } else if meta.job_execution.is_some() {
+            tracing::info!(
+                agent = i,
+                job_id = ?meta.job_execution.as_ref().map(|execution| execution.job_id),
+                "dropping panicked delegated-job batch; durable reconciliation owns continuation"
             );
         } else if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {

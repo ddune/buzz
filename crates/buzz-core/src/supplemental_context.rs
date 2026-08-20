@@ -42,6 +42,7 @@ pub enum SupplementalContextProtocolError {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContentEnvelope {
     content: String,
 }
@@ -177,6 +178,18 @@ mod tests {
         duplicate
             .tags
             .push(Tag::parse(["supplemental-event", &"01".repeat(32)]).unwrap());
+        assert!(parse_supplemental_context(&duplicate).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_and_duplicate_content_fields() {
+        let keys = Keys::generate();
+        let mut unknown = event(&keys);
+        unknown.content = r#"{"content":"status?","unexpected":true}"#.into();
+        assert!(parse_supplemental_context(&unknown).is_err());
+
+        let mut duplicate = event(&keys);
+        duplicate.content = r#"{"content":"first","content":"second"}"#.into();
         assert!(parse_supplemental_context(&duplicate).is_err());
     }
 }
