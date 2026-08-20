@@ -599,6 +599,18 @@ fn validate_followup_reply_shape(p: &SendMessageParams) -> Result<(), CliError> 
     Ok(())
 }
 
+fn validate_followup_channel_scope(channel_id: Uuid) -> Result<(), CliError> {
+    let expected = std::env::var("BUZZ_JOB_FOLLOWUP_CHANNEL_ID").map_err(|_| {
+        CliError::Usage("accepted-job follow-up channel authority is unavailable".into())
+    })?;
+    if Uuid::parse_str(&expected).ok() != Some(channel_id) {
+        return Err(CliError::Usage(
+            "accepted-job follow-up cannot reply outside its channel".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn project_followup_reply_authority(
     admission_events: Vec<Event>,
     job_events: Vec<Event>,
@@ -753,6 +765,7 @@ pub async fn cmd_send_message(
     }
     let channel_uuid = parse_uuid(&p.channel_id)?;
     if restricted_followup {
+        validate_followup_channel_scope(channel_uuid)?;
         validate_followup_reply_authority(
             client,
             channel_uuid,
@@ -1271,6 +1284,14 @@ mod tests {
     #[test]
     fn restricted_followup_reply_requires_a_durable_current_acceptance() {
         let (admissions, jobs, channel, source, target) = followup_authority_events(false);
+        assert!(project_followup_reply_authority(
+            admissions.clone(),
+            jobs.clone(),
+            Uuid::new_v4(),
+            &source,
+            &target,
+        )
+        .is_err());
         assert!(project_followup_reply_authority(
             admissions.clone(),
             jobs,

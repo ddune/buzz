@@ -2167,27 +2167,6 @@ async fn tokio_main() -> Result<()> {
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
-    // Online means the harness can receive work, not merely that its socket is
-    // connected. Publishing after channel subscriptions gives desktop callers
-    // a durable readiness boundary before they send a startup mention.
-    if config.presence_enabled {
-        match publish_presence(&presence_publisher, &presence_keys, "online").await {
-            Ok(_) => tracing::info!("presence set to online"),
-            Err(e) => tracing::warn!("failed to set initial presence: {e}"),
-        }
-    }
-
-    if config.lazy_pool {
-        emit_runtime_lifecycle(
-            observer.as_ref(),
-            &runtime_start_nonce,
-            &pubkey_hex,
-            &config.relay_url,
-            "listening",
-            None,
-        );
-    }
-
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -2227,19 +2206,48 @@ async fn tokio_main() -> Result<()> {
 
     let mut queued_job_attempts = HashSet::new();
     let mut pending_job_promotions = HashMap::<Uuid, job_execution::JobEvaluationContext>::new();
-    match job_execution::reconcile(
-        &ctx.rest_client,
-        &queued_job_attempts,
-        &HashSet::new(),
-        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
-    )
-    .await
-    {
-        Ok(snapshot) => {
-            queue.sync_accepted_job_guards(snapshot.accepted_jobs);
-            enqueue_job_continuations(&mut queue, &mut queued_job_attempts, snapshot.work);
+    // Do not enter the dispatch loop until durable accepted-job ownership is
+    // known. A transient startup query failure must never create a window in
+    // which an accepted channel is treated as unrestricted conversation.
+    let startup_snapshot = loop {
+        match job_execution::reconcile(
+            &ctx.rest_client,
+            &queued_job_attempts,
+            &HashSet::new(),
+            config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+        )
+        .await
+        {
+            Ok(snapshot) => break snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "initial delegated-job reconciliation failed; dispatch remains closed: {error}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
-        Err(error) => tracing::warn!("initial delegated-job reconciliation failed: {error}"),
+    };
+    queue.sync_accepted_job_guards(startup_snapshot.accepted_jobs);
+    enqueue_job_continuations(&mut queue, &mut queued_job_attempts, startup_snapshot.work);
+
+    // Online means the harness can receive work, not merely that its socket is
+    // connected. The durable job projection above is part of readiness.
+    if config.presence_enabled {
+        match publish_presence(&presence_publisher, &presence_keys, "online").await {
+            Ok(_) => tracing::info!("presence set to online"),
+            Err(e) => tracing::warn!("failed to set initial presence: {e}"),
+        }
+    }
+
+    if config.lazy_pool {
+        emit_runtime_lifecycle(
+            observer.as_ref(),
+            &runtime_start_nonce,
+            &pubkey_hex,
+            &config.relay_url,
+            "listening",
+            None,
+        );
     }
 
     let mut job_reconciliation = tokio::time::interval_at(
@@ -3581,6 +3589,8 @@ async fn tokio_main() -> Result<()> {
                 let (drain_action, panicked_evaluations) = drain_ready_join_results(
                     &mut pool,
                     &mut queue,
+                    &ctx.rest_client,
+                    &mut queued_job_attempts,
                     &config,
                     &mut heartbeat_in_flight,
                     &removed_channels,
@@ -3589,7 +3599,8 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                );
+                )
+                .await;
                 if drain_action == LoopAction::Exit {
                     tracing::warn!(
                         pending_promotions = panicked_evaluations.len(),
@@ -3624,29 +3635,14 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
-                if let Some(meta) = pool.task_map().get(&join_error.id()) {
-                    if let (Some(execution), Some(channel_id)) =
-                        (meta.job_execution.clone(), meta.channel_id)
-                    {
-                        let turn_id = meta.turn_id.clone();
-                        if persist_job_attempt_finish(
-                            &ctx.rest_client,
-                            &execution,
-                            channel_id,
-                            &turn_id,
-                            "worker_loss",
-                            "prompt task panicked",
-                        )
-                        .await
-                        {
-                            release_finished_job_attempt(
-                                &mut queued_job_attempts,
-                                execution.attempt_id,
-                                true,
-                            );
-                        }
-                    }
-                }
+                persist_panicked_job_attempt(
+                    &pool,
+                    &ctx.rest_client,
+                    &mut queued_job_attempts,
+                    join_error.id(),
+                    "prompt task panicked",
+                )
+                .await;
                 tracing::error!("agent task panicked: {join_error}");
                 let panicked_evaluation = recover_panicked_agent(
                     &mut pool,
@@ -4520,6 +4516,38 @@ fn release_finished_job_attempt(
     finish_persisted && queued_attempts.remove(&attempt_id)
 }
 
+/// Both Tokio panic ingress paths must cross the same durable finish boundary
+/// before task metadata/channel ownership is released.
+async fn persist_panicked_job_attempt(
+    pool: &AgentPool,
+    rest: &relay::RestClient,
+    queued_job_attempts: &mut HashSet<Uuid>,
+    task_id: tokio::task::Id,
+    detail: &str,
+) {
+    let panicked_execution = pool.task_map().get(&task_id).and_then(|meta| {
+        Some((
+            meta.job_execution.clone()?,
+            meta.channel_id?,
+            meta.turn_id.clone(),
+        ))
+    });
+    if let Some((execution, channel_id, turn_id)) = panicked_execution {
+        if persist_job_attempt_finish(
+            rest,
+            &execution,
+            channel_id,
+            &turn_id,
+            "worker_loss",
+            detail,
+        )
+        .await
+        {
+            release_finished_job_attempt(queued_job_attempts, execution.attempt_id, true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod execution_authority_release_tests {
     use super::release_finished_job_attempt;
@@ -5354,9 +5382,11 @@ fn recover_panicked_agent(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_ready_join_results(
+async fn drain_ready_join_results(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
+    rest: &relay::RestClient,
+    queued_job_attempts: &mut HashSet<Uuid>,
     config: &Config,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
@@ -5370,6 +5400,14 @@ fn drain_ready_join_results(
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
+            persist_panicked_job_attempt(
+                pool,
+                rest,
+                queued_job_attempts,
+                join_error.id(),
+                "prompt task panicked while draining ready results",
+            )
+            .await;
             if let Some(evaluation) = recover_panicked_agent(
                 pool,
                 queue,

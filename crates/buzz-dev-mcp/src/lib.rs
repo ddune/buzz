@@ -148,10 +148,13 @@ fn job_followup_readonly() -> bool {
 }
 
 fn followup_shell_command_allowed(command: &str) -> bool {
-    followup_shell_command_allowed_for(command)
+    let Ok(expected_channel) = std::env::var("BUZZ_JOB_FOLLOWUP_CHANNEL_ID") else {
+        return false;
+    };
+    followup_shell_command_allowed_for(command, &expected_channel)
 }
 
-fn followup_shell_command_allowed_for(command: &str) -> bool {
+fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> bool {
     let Some(words) = restricted_shell_words(command) else {
         return false;
     };
@@ -173,12 +176,11 @@ fn followup_shell_command_allowed_for(command: &str) -> bool {
             return false;
         }
     }
-    options
-        .get("--channel")
-        .is_some_and(|channel| uuid::Uuid::parse_str(channel).is_ok())
-        && options
-            .get("--content")
-            .is_some_and(|content| !content.is_empty() && *content != "-")
+    options.get("--channel").is_some_and(|channel| {
+        channel == &expected_channel && uuid::Uuid::parse_str(channel).is_ok()
+    }) && options
+        .get("--content")
+        .is_some_and(|content| !content.is_empty() && *content != "-")
         && options.get("--reply-to").is_some_and(|event_id| {
             event_id.len() == 64 && event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
@@ -418,7 +420,8 @@ mod evaluation_tests {
         assert!(followup_shell_command_allowed_for(
             &format!(
                 "buzz messages send --channel {channel} --content 'Work on `marker-a.txt` is checkpointed.' --reply-to {event}"
-            )
+            ),
+            channel,
         ));
         for command in [
             format!("buzz messages send --channel {channel} --content - --reply-to {event}"),
@@ -432,11 +435,12 @@ mod evaluation_tests {
             format!("buzz messages send --channel {channel} --content * --reply-to {event}"),
             format!("buzz messages send --channel {channel} --content ok --reply-to {event} --reply-to {event}"),
             format!("buzz messages send --channel not-a-uuid --content ok --reply-to {event}"),
+            format!("buzz messages send --channel 00000000-0000-0000-0000-000000000099 --content ok --reply-to {event}"),
             format!("buzz messages send --channel {channel} --content 'ok'; touch marker --reply-to {event}"),
             "buzz jobs complete --job id".into(),
         ] {
             assert!(
-                !followup_shell_command_allowed_for(&command),
+                !followup_shell_command_allowed_for(&command, channel),
                 "admitted: {command}"
             );
         }

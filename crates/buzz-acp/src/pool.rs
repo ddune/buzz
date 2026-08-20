@@ -1329,12 +1329,15 @@ fn mcp_servers_with_git_origin(
         for server in &mut servers {
             server.name = match capability_profile {
                 SessionCapabilityProfile::JobDecision => "buzz-dev-mcp-job-decision".into(),
-                // One process-global broker is deliberately reused. Its shell
-                // surface is only the exact `buzz messages send` shape; the
-                // CLI revalidates the reply target against durable relay state
-                // on every call. This supports native steering without
-                // accumulating stale credential-bearing MCP processes.
-                SessionCapabilityProfile::JobFollowupReadonly => "buzz-dev-mcp-job-followup".into(),
+                // Hermes cannot pass the invoking ACP session identity to a
+                // process-global MCP server. Scope one reusable broker to the
+                // channel instead: native steering in that channel can admit
+                // new reply IDs, while a session in channel A cannot invoke
+                // reply authority for channel B.
+                SessionCapabilityProfile::JobFollowupReadonly => format!(
+                    "buzz-dev-mcp-job-followup-{}",
+                    channel_id.map_or_else(|| "unscoped".into(), |channel| channel.to_string())
+                ),
                 _ => server.name.clone(),
             };
         }
@@ -1390,6 +1393,12 @@ fn mcp_servers_with_git_origin(
                     name: "BUZZ_JOB_FOLLOWUP_READONLY".into(),
                     value: "1".into(),
                 });
+                if let Some(channel_id) = channel_id {
+                    server.env.push(EnvVar {
+                        name: "BUZZ_JOB_FOLLOWUP_CHANNEL_ID".into(),
+                        value: channel_id.to_string(),
+                    });
+                }
             }
             SessionCapabilityProfile::Ordinary | SessionCapabilityProfile::JobExecution => {}
         }
@@ -5012,17 +5021,21 @@ mod tests {
         );
 
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "buzz-dev-mcp-job-followup");
+        assert_eq!(
+            servers[0].name,
+            format!("buzz-dev-mcp-job-followup-{channel}")
+        );
         assert!(servers[0]
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_READONLY" && entry.value == "1"));
-        for name in [
-            "BUZZ_JOB_FOLLOWUP_CHANNEL_ID",
-            "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS",
-        ] {
-            assert!(!servers[0].env.iter().any(|entry| entry.name == name));
-        }
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_JOB_FOLLOWUP_CHANNEL_ID" && entry.value == channel.to_string()
+        }));
+        assert!(!servers[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS"));
         for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
             assert!(!servers[0].env.iter().any(|entry| entry.name == name));
         }
@@ -5044,6 +5057,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(env(&servers[0]), env(&later[0]));
+
+        let other_channel = Uuid::new_v4();
+        let other = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(other_channel),
+            Some("stream"),
+            None,
+            SessionCapabilityProfile::JobFollowupReadonly,
+            &reply_ids,
+        );
+        assert_ne!(servers[0].name, other[0].name);
+        assert_ne!(env(&servers[0]), env(&other[0]));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
