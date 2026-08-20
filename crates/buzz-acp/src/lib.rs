@@ -2167,27 +2167,6 @@ async fn tokio_main() -> Result<()> {
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
-    // Online means the harness can receive work, not merely that its socket is
-    // connected. Publishing after channel subscriptions gives desktop callers
-    // a durable readiness boundary before they send a startup mention.
-    if config.presence_enabled {
-        match publish_presence(&presence_publisher, &presence_keys, "online").await {
-            Ok(_) => tracing::info!("presence set to online"),
-            Err(e) => tracing::warn!("failed to set initial presence: {e}"),
-        }
-    }
-
-    if config.lazy_pool {
-        emit_runtime_lifecycle(
-            observer.as_ref(),
-            &runtime_start_nonce,
-            &pubkey_hex,
-            &config.relay_url,
-            "listening",
-            None,
-        );
-    }
-
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -2227,15 +2206,48 @@ async fn tokio_main() -> Result<()> {
 
     let mut queued_job_attempts = HashSet::new();
     let mut pending_job_promotions = HashMap::<Uuid, job_execution::JobEvaluationContext>::new();
-    match job_execution::reconcile(
-        &ctx.rest_client,
-        &queued_job_attempts,
-        config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
-    )
-    .await
-    {
-        Ok(work) => enqueue_job_continuations(&mut queue, &mut queued_job_attempts, work),
-        Err(error) => tracing::warn!("initial delegated-job reconciliation failed: {error}"),
+    // Do not enter the dispatch loop until durable accepted-job ownership is
+    // known. A transient startup query failure must never create a window in
+    // which an accepted channel is treated as unrestricted conversation.
+    let startup_snapshot = loop {
+        match job_execution::reconcile(
+            &ctx.rest_client,
+            &queued_job_attempts,
+            &HashSet::new(),
+            config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+        )
+        .await
+        {
+            Ok(snapshot) => break snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "initial delegated-job reconciliation failed; dispatch remains closed: {error}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    queue.sync_accepted_job_guards(startup_snapshot.accepted_jobs);
+    enqueue_job_continuations(&mut queue, &mut queued_job_attempts, startup_snapshot.work);
+
+    // Online means the harness can receive work, not merely that its socket is
+    // connected. The durable job projection above is part of readiness.
+    if config.presence_enabled {
+        match publish_presence(&presence_publisher, &presence_keys, "online").await {
+            Ok(_) => tracing::info!("presence set to online"),
+            Err(e) => tracing::warn!("failed to set initial presence: {e}"),
+        }
+    }
+
+    if config.lazy_pool {
+        emit_runtime_lifecycle(
+            observer.as_ref(),
+            &runtime_start_nonce,
+            &pubkey_hex,
+            &config.relay_url,
+            "listening",
+            None,
+        );
     }
 
     let mut job_reconciliation = tokio::time::interval_at(
@@ -2645,13 +2657,16 @@ async fn tokio_main() -> Result<()> {
                 }
                 _ = job_reconciliation.tick() => {
                     let _ = result_rx;
+                    let deferred_channels = queue.channels_blocking_new_job_claims();
                     match job_execution::reconcile(
                         &ctx.rest_client,
                         &queued_job_attempts,
+                        &deferred_channels,
                         config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
                     ).await {
-                        Ok(work) => {
-                            enqueue_job_continuations(&mut queue, &mut queued_job_attempts, work);
+                        Ok(snapshot) => {
+                            queue.sync_accepted_job_guards(snapshot.accepted_jobs);
+                            enqueue_job_continuations(&mut queue, &mut queued_job_attempts, snapshot.work);
                             if pool_ready {
                                 for (channel_id, thread_tags) in
                                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
@@ -2787,6 +2802,37 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            // A durable terminal disposition releases any
+                            // queued read-only follow-up classification for
+                            // this job. Until this exact lifecycle event, the
+                            // accepted obligation continues to own mutation
+                            // authority even if its runtime turn ended.
+                            if matches!(
+                                kind_u32,
+                                KIND_JOB_REJECTED
+                                    | KIND_JOB_COMPLETED
+                                    | KIND_JOB_BLOCKED
+                                    | KIND_JOB_DELEGATED
+                            ) {
+                                if let Ok(lifecycle) =
+                                    buzz_core::delegated_job::parse_job_lifecycle(
+                                        &buzz_event.event,
+                                    )
+                                {
+                                    if lifecycle.author == pubkey_hex
+                                        && lifecycle.channel_id == buzz_event.channel_id
+                                    {
+                                        let released = queue
+                                            .release_terminal_job_followups(lifecycle.job_id);
+                                        tracing::info!(
+                                            job_id = %lifecycle.job_id,
+                                            released,
+                                            "terminal delegated-job event released queued follow-up restrictions"
+                                        );
+                                    }
+                                }
+                            }
+
                             // Accept/reject is a structural boundary for a
                             // delegated-job evaluation turn. Observe our own
                             // lifecycle events before the generic ignore-self
@@ -2819,6 +2865,14 @@ async fn tokio_main() -> Result<()> {
                                             "delegated-job decision closed its evaluation turn"
                                         );
                                         if kind_u32 == KIND_JOB_ACCEPTED {
+                                            queue.activate_accepted_job_guard(
+                                                job_execution::AcceptedJobGuard {
+                                                    job_id: evaluation.job_id,
+                                                    request_event_id: evaluation.request_event_id.clone(),
+                                                    channel_id: evaluation.channel_id,
+                                                    last_execution: None,
+                                                },
+                                            );
                                             tracing::info!(
                                                 job_id = %evaluation.job_id,
                                                 acceptance_event_id = %buzz_event.event.id,
@@ -2856,6 +2910,17 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 }
                                 continue;
+                            }
+
+                            if kind_u32 == buzz_core::kind::KIND_STREAM_MESSAGE
+                                && buzz_event.event.pubkey.to_hex() == pubkey_hex
+                                && queue.record_job_followup_response(&buzz_event.event)
+                            {
+                                tracing::info!(
+                                    response_event_id = %buzz_event.event.id,
+                                    channel_id = %buzz_event.channel_id,
+                                    "attached durable restricted follow-up response to queued continuation"
+                                );
                             }
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
@@ -3081,6 +3146,62 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                             };
+                            // The author gate and subscription rule above are
+                            // the admission boundary. If an accepted job owns
+                            // this channel, attest the exact supplemental event
+                            // before it can steer, cancel, or enter a session.
+                            // A failed attestation is fail-closed: the active
+                            // execution is left untouched and no untracked
+                            // replacement receives the message.
+                            if queue.accepted_job_channel_is_ambiguous(buzz_event.channel_id) {
+                                tracing::error!(
+                                    channel_id = %buzz_event.channel_id,
+                                    source_event_id = %buzz_event.event.id,
+                                    "dropping supplemental event because accepted-job channel ownership is ambiguous"
+                                );
+                                continue;
+                            }
+                            if let Some(guard) =
+                                queue.accepted_job_guard(buzz_event.channel_id).cloned()
+                            {
+                                let continuation_generation = queue
+                                    .supplemental_target_generation(buzz_event.channel_id)
+                                    .or_else(|| {
+                                        active_job_execution_for_channel(
+                                            &pool,
+                                            buzz_event.channel_id,
+                                        )
+                                        .map(|execution| execution.generation.saturating_add(1))
+                                    })
+                                    .unwrap_or_else(|| {
+                                        guard.last_execution.as_ref().map_or(1, |execution| {
+                                            execution.generation.saturating_add(1)
+                                        })
+                                    });
+                                match job_execution::persist_supplemental_admission(
+                                    &ctx.rest_client,
+                                    &guard,
+                                    &buzz_event.event,
+                                    continuation_generation,
+                                )
+                                .await
+                                {
+                                    Ok(admission) => tracing::info!(
+                                        job_id = %guard.job_id,
+                                        source_event_id = %buzz_event.event.id,
+                                        admission_event_id = %admission.id,
+                                        "durably admitted accepted-job supplemental context"
+                                    ),
+                                    Err(error) => {
+                                        tracing::error!(
+                                            job_id = %guard.job_id,
+                                            source_event_id = %buzz_event.event.id,
+                                            "dropping accepted-job supplemental event because durable admission failed: {error}"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
@@ -3149,8 +3270,26 @@ async fn tokio_main() -> Result<()> {
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
-                                        );
+                                    );
                                     if !native_attempted {
+                                        let boundary_ready = !matches!(
+                                            signal,
+                                            ControlSignal::Steer | ControlSignal::Interrupt
+                                        ) || persist_job_followup_boundary(
+                                                &pool,
+                                                &mut queue,
+                                                &ctx.rest_client,
+                                                buzz_event.channel_id,
+                                                &event_id_hex,
+                                            ).await;
+                                        if !boundary_ready {
+                                            tracing::error!(
+                                                channel = %buzz_event.channel_id,
+                                                event_id = %event_id_hex,
+                                                "refusing cancel-and-merge because durable job follow-up boundary could not be established"
+                                            );
+                                            continue;
+                                        }
                                         signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -3338,14 +3477,58 @@ async fn tokio_main() -> Result<()> {
                             .get(&evaluation.channel_id)
                             .cloned()
                     });
-                if let Some(attempt_id) = pool
+                let completed_followup = pool
                     .task_map()
                     .values()
                     .find(|meta| meta.agent_index == result.agent.index)
-                    .and_then(|meta| meta.job_execution.as_ref())
-                    .map(|execution| execution.attempt_id)
-                {
-                    queued_job_attempts.remove(&attempt_id);
+                    .and_then(|meta| meta.recoverable_batch.as_ref())
+                    .and_then(|batch| {
+                        batch.events.iter().find_map(|event| {
+                            job_execution::followup_from_prompt_tag(&event.prompt_tag).map(
+                                |followup| job_execution::JobEvaluationContext {
+                                    job_id: followup.job_id,
+                                    request_event_id: followup.request_event_id,
+                                    channel_id: batch.channel_id,
+                                },
+                            )
+                        })
+                    });
+                let completed_execution = pool
+                    .task_map()
+                    .values()
+                    .find(|meta| meta.agent_index == result.agent.index)
+                    .and_then(|meta| {
+                        Some((
+                            meta.job_execution.clone()?,
+                            meta.channel_id?,
+                            meta.turn_id.clone(),
+                        ))
+                    });
+                if let Some((execution, channel_id, turn_id)) = completed_execution {
+                    let persisted = if queue.job_attempt_is_prefinished(execution.attempt_id) {
+                        true
+                    } else {
+                        persist_job_attempt_finish(
+                            &ctx.rest_client,
+                            &execution,
+                            channel_id,
+                            &turn_id,
+                            prompt_outcome_label(&result.outcome),
+                            "",
+                        )
+                        .await
+                    };
+                    if persisted {
+                        // handle_prompt_result consumes this marker instead of
+                        // issuing another finish. Only now may reconciliation
+                        // stop treating the old claim as locally owned.
+                        queue.mark_job_attempt_prefinished(execution.attempt_id);
+                        release_finished_job_attempt(
+                            &mut queued_job_attempts,
+                            execution.attempt_id,
+                            true,
+                        );
+                    }
                 }
                 // Stop typing indicator for the completed channel.
                 if let PromptSource::Channel(ch) = &result.source {
@@ -3386,9 +3569,28 @@ async fn tokio_main() -> Result<()> {
                     )
                     .await;
                 }
+                if let Some(evaluation) = completed_followup {
+                    if !queue.has_outstanding_followup_for_job(evaluation.job_id) {
+                        tracing::info!(
+                            job_id = %evaluation.job_id,
+                            channel_id = %evaluation.channel_id,
+                            "restricted follow-up boundary ended; reconciling sole durable continuation"
+                        );
+                        promote_accepted_job(
+                            &ctx.rest_client,
+                            &mut queue,
+                            &mut queued_job_attempts,
+                            &evaluation,
+                            config.max_turn_duration_secs + queue::IN_FLIGHT_DEADLINE_BUFFER_SECS,
+                        )
+                        .await;
+                    }
+                }
                 let (drain_action, panicked_evaluations) = drain_ready_join_results(
                     &mut pool,
                     &mut queue,
+                    &ctx.rest_client,
+                    &mut queued_job_attempts,
                     &config,
                     &mut heartbeat_in_flight,
                     &removed_channels,
@@ -3397,7 +3599,8 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
-                );
+                )
+                .await;
                 if drain_action == LoopAction::Exit {
                     tracing::warn!(
                         pending_promotions = panicked_evaluations.len(),
@@ -3432,30 +3635,15 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
-                if let Some(meta) = pool.task_map().get(&join_error.id()) {
-                    if let (Some(execution), Some(channel_id)) =
-                        (meta.job_execution.clone(), meta.channel_id)
-                    {
-                        queued_job_attempts.remove(&execution.attempt_id);
-                        let rest = ctx.rest_client.clone();
-                        let turn_id = meta.turn_id.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = job_execution::finish(
-                                &rest,
-                                &execution,
-                                channel_id,
-                                &turn_id,
-                                &execution.claim_event_id,
-                                "worker_loss",
-                                "prompt task panicked",
-                            )
-                            .await
-                            {
-                                tracing::warn!(job_id=%execution.job_id, attempt_id=%execution.attempt_id, "failed to record panicked attempt: {error}");
-                            }
-                        });
-                    }
-                }
+                persist_panicked_job_attempt(
+                    &pool,
+                    &mut queue,
+                    &ctx.rest_client,
+                    &mut queued_job_attempts,
+                    join_error.id(),
+                    "prompt task panicked",
+                )
+                .await;
                 tracing::error!("agent task panicked: {join_error}");
                 let panicked_evaluation = recover_panicked_agent(
                     &mut pool,
@@ -3636,6 +3824,22 @@ async fn tokio_main() -> Result<()> {
                     queue.release_native_steer(channel_id, &event_id);
                 }
                 if signal_fallback {
+                    if !persist_job_followup_boundary(
+                        &pool,
+                        &mut queue,
+                        &ctx.rest_client,
+                        channel_id,
+                        &event_id,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            "refusing failed-steer cancellation because durable job follow-up boundary could not be established"
+                        );
+                        continue;
+                    }
                     // Universal cancel+merge fallback. Note: the
                     // queued event has already been released to the
                     // front of `queues[channel_id]`, so the cancel
@@ -3983,19 +4187,98 @@ fn signal_in_flight_task(
     false
 }
 
-/// Stop exactly the proposal turn that produced a durable accept/reject event.
-/// Ordinary work in the same channel is deliberately unaffected.
+/// Return the durable execution authority currently bound to a channel turn.
+/// A generic conversation task deliberately returns `None`.
+fn active_job_execution_for_channel(
+    pool: &AgentPool,
+    channel_id: uuid::Uuid,
+) -> Option<job_execution::JobExecutionContext> {
+    pool.task_map()
+        .values()
+        .find(|meta| meta.channel_id == Some(channel_id))
+        .and_then(|meta| meta.job_execution.clone())
+}
+
+/// Persist the execution boundary before cancel-and-merge tears down the only
+/// mutation-capable turn. If persistence fails, cancellation is refused so a
+/// successor cannot race an unrecorded interruption.
+async fn persist_job_followup_boundary(
+    pool: &AgentPool,
+    queue: &mut EventQueue,
+    rest: &relay::RestClient,
+    channel_id: Uuid,
+    event_id: &str,
+) -> bool {
+    let Some(execution) = active_job_execution_for_channel(pool, channel_id) else {
+        // The channel may already be serving a restricted follow-up. Its guard
+        // was applied at queue ingress, and there is no live execution claim to
+        // finish a second time.
+        return true;
+    };
+    let classified = queue.mark_job_followup(channel_id, event_id, &execution);
+    if !classified {
+        return false;
+    }
+    let detail = match job_execution::followup_boundary_detail(event_id) {
+        Ok(detail) => detail,
+        Err(error) => {
+            tracing::error!(%event_id, "failed to encode durable follow-up boundary: {error}");
+            return false;
+        }
+    };
+    match job_execution::finish(
+        rest,
+        &execution,
+        channel_id,
+        &execution.turn_id,
+        &execution.claim_event_id,
+        "cancel_and_merge",
+        &detail,
+    )
+    .await
+    {
+        Ok(()) => {
+            queue.mark_job_attempt_prefinished(execution.attempt_id);
+            tracing::info!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                generation = execution.generation,
+                %channel_id,
+                %event_id,
+                "durable accepted-job follow-up boundary persisted before cancellation"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                %channel_id,
+                %event_id,
+                "failed to persist accepted-job follow-up boundary: {error}"
+            );
+            false
+        }
+    }
+}
+
+/// Stop the channel turn that exists when a durable decision arrives. The
+/// matching evaluation is marked decided; an unrelated ordinary turn is also
+/// rotated before an accepted job may be claimed, closing stale base-session
+/// mutation authority.
 fn signal_job_evaluation_boundary(
     pool: &mut AgentPool,
     evaluation: &job_execution::JobEvaluationContext,
 ) -> bool {
-    let entry = pool
-        .task_map_mut()
-        .values_mut()
-        .find(|meta| meta.job_evaluation.as_ref() == Some(evaluation));
+    let entry = pool.task_map_mut().values_mut().find(|meta| {
+        meta.job_evaluation.as_ref() == Some(evaluation)
+            || meta.channel_id == Some(evaluation.channel_id)
+    });
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            meta.job_evaluation_decided = true;
+            if meta.job_evaluation.as_ref() == Some(evaluation) {
+                meta.job_evaluation_decided = true;
+            }
             let _ = tx.send(ControlSignal::Rotate);
             return true;
         }
@@ -4178,6 +4461,162 @@ async fn promote_accepted_job(
     );
 }
 
+/// Persist the attempt boundary before releasing local claim ownership.
+/// Bounded retries cover short relay visibility/network faults; if all fail,
+/// the in-memory queued-attempt guard remains armed and reconciliation cannot
+/// recover/redispatch the still-active claim in this process.
+async fn persist_job_attempt_finish(
+    rest: &relay::RestClient,
+    execution: &job_execution::JobExecutionContext,
+    channel_id: Uuid,
+    turn_id: &str,
+    outcome: &str,
+    detail: &str,
+) -> bool {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match job_execution::finish(
+            rest,
+            execution,
+            channel_id,
+            turn_id,
+            &execution.claim_event_id,
+            outcome,
+            detail,
+        )
+        .await
+        {
+            Ok(()) => return true,
+            Err(error) if attempt < ATTEMPTS => {
+                tracing::warn!(
+                    job_id = %execution.job_id,
+                    attempt_id = %execution.attempt_id,
+                    retry = attempt,
+                    "attempt finish not yet durable; retaining local claim guard: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(50_u64 << (attempt - 1))).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id = %execution.job_id,
+                    attempt_id = %execution.attempt_id,
+                    "attempt finish could not be persisted; local claim guard remains armed: {error}"
+                );
+                return false;
+            }
+        }
+    }
+    false
+}
+
+fn release_finished_job_attempt(
+    queued_attempts: &mut HashSet<Uuid>,
+    attempt_id: Uuid,
+    finish_persisted: bool,
+) -> bool {
+    finish_persisted && queued_attempts.remove(&attempt_id)
+}
+
+fn release_prefinished_job_attempt(
+    queue: &mut EventQueue,
+    queued_attempts: &mut HashSet<Uuid>,
+    attempt_id: Uuid,
+) -> bool {
+    let prefinished = queue.take_job_attempt_prefinished(attempt_id);
+    if prefinished {
+        let _ = release_finished_job_attempt(queued_attempts, attempt_id, true);
+    }
+    prefinished
+}
+
+/// Both Tokio panic ingress paths must cross the same durable finish boundary
+/// before task metadata/channel ownership is released.
+async fn persist_panicked_job_attempt(
+    pool: &AgentPool,
+    queue: &mut EventQueue,
+    rest: &relay::RestClient,
+    queued_job_attempts: &mut HashSet<Uuid>,
+    task_id: tokio::task::Id,
+    detail: &str,
+) {
+    let panicked_execution = pool.task_map().get(&task_id).and_then(|meta| {
+        Some((
+            meta.job_execution.clone()?,
+            meta.channel_id?,
+            meta.turn_id.clone(),
+        ))
+    });
+    if let Some((execution, channel_id, turn_id)) = panicked_execution {
+        if release_prefinished_job_attempt(queue, queued_job_attempts, execution.attempt_id) {
+            tracing::debug!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                "panicked attempt finish already persisted at cancel-and-merge boundary"
+            );
+            return;
+        }
+        if persist_job_attempt_finish(
+            rest,
+            &execution,
+            channel_id,
+            &turn_id,
+            "worker_loss",
+            detail,
+        )
+        .await
+        {
+            release_finished_job_attempt(queued_job_attempts, execution.attempt_id, true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_authority_release_tests {
+    use super::{release_finished_job_attempt, release_prefinished_job_attempt};
+    use crate::config::DedupMode;
+    use crate::queue::EventQueue;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn local_claim_guard_releases_only_after_durable_finish() {
+        let attempt = Uuid::new_v4();
+        let mut queued = HashSet::from([attempt]);
+        assert!(!release_finished_job_attempt(&mut queued, attempt, false));
+        assert!(queued.contains(&attempt));
+        assert!(release_finished_job_attempt(&mut queued, attempt, true));
+        assert!(!queued.contains(&attempt));
+    }
+
+    #[test]
+    fn prefinished_cancelled_panic_consumes_marker_and_releases_guard() {
+        let attempt = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.mark_job_attempt_prefinished(attempt);
+        let mut queued = HashSet::from([attempt]);
+
+        assert!(release_prefinished_job_attempt(
+            &mut queue,
+            &mut queued,
+            attempt
+        ));
+        assert!(!queued.contains(&attempt));
+        assert!(!queue.take_job_attempt_prefinished(attempt));
+    }
+}
+
+fn prompt_outcome_label(outcome: &PromptOutcome) -> &'static str {
+    match outcome {
+        PromptOutcome::Ok(_) => "ok",
+        PromptOutcome::Error(_) => "error",
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
+        PromptOutcome::AgentExited => "exited",
+        PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
+    }
+}
+
 fn take_pending_job_promotion(
     pending: &mut HashMap<Uuid, job_execution::JobEvaluationContext>,
     evaluation: Option<job_execution::JobEvaluationContext>,
@@ -4200,11 +4639,18 @@ fn enqueue_job_continuations(
             tracing::warn!(%attempt_id, "dropping continuation with malformed request root");
             continue;
         };
+        // A restricted conversational reply is offered only on the live
+        // ingress path. Recovery never replays it ahead of a durable claim:
+        // the reply is optional, while the admitted message itself is carried
+        // in supplemental_messages and must not delay execution authority.
         queue.push_durable_continuation(QueuedEvent {
             channel_id,
             event: continuation.request,
             received_at: std::time::Instant::now(),
-            prompt_tag: match job_execution::prompt_tag(&continuation.execution) {
+            prompt_tag: match job_execution::prompt_tag_with_supplemental_messages(
+                &continuation.execution,
+                continuation.supplemental_messages,
+            ) {
                 Ok(tag) => tag,
                 Err(error) => {
                     tracing::warn!(%attempt_id, "failed to encode continuation metadata: {error}");
@@ -4262,6 +4708,18 @@ fn dispatch_pending(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
+        let authority_transition = batch.events.iter().any(|event| {
+            job_execution::from_prompt_tag(&event.prompt_tag).is_some()
+                || job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+        });
+        if authority_transition {
+            let invalidated = pool.invalidate_channel_sessions(channel_id);
+            tracing::info!(
+                %channel_id,
+                invalidated,
+                "invalidated stale channel sessions before delegated-job authority transition"
+            );
+        }
         let affinity_hit = pool.has_session_for(channel_id);
         let mut agent = match pool.try_claim(Some(channel_id)) {
             Some(a) => a,
@@ -4607,15 +5065,7 @@ fn handle_prompt_result(
         result.agent.state.invalidate_channel(ch);
     }
 
-    let outcome_label = match &result.outcome {
-        PromptOutcome::Ok(_) => "ok",
-        PromptOutcome::Error(_) => "error",
-        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
-        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
-        PromptOutcome::AgentExited => "exited",
-        PromptOutcome::Cancelled => "cancelled",
-        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
-    };
+    let outcome_label = prompt_outcome_label(&result.outcome);
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
     // moved into match arms below. `desired_model` reflects the config/persona
@@ -4636,26 +5086,23 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
-    if let (Some(execution), Some(channel_id), Some(rest_client)) =
-        (job_execution, channel_id, rest_client.cloned())
-    {
-        let outcome = outcome_label.to_string();
-        let turn_id = turn_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = job_execution::finish(
-                &rest_client,
-                &execution,
-                channel_id,
-                &turn_id,
-                &execution.claim_event_id,
-                &outcome,
-                "",
-            )
-            .await
-            {
-                tracing::warn!(job_id=%execution.job_id, attempt_id=%execution.attempt_id, "failed to record execution-attempt outcome: {error}");
-            }
-        });
+    let job_attempt_prefinished = job_execution
+        .as_ref()
+        .is_some_and(|execution| queue.take_job_attempt_prefinished(execution.attempt_id));
+    if let (Some(execution), Some(_channel_id)) = (job_execution, channel_id) {
+        if job_attempt_prefinished {
+            tracing::debug!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                "execution-attempt outcome already persisted at cancel-and-merge boundary"
+            );
+        } else {
+            tracing::error!(
+                job_id = %execution.job_id,
+                attempt_id = %execution.attempt_id,
+                "execution result reached release without a durable finish; local reconciliation guard must remain armed"
+            );
+        }
     }
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
@@ -4891,6 +5338,12 @@ fn recover_panicked_agent(
                 job_id = ?job_evaluation.as_ref().map(|evaluation| evaluation.job_id),
                 "consuming decided delegated-job evaluation after panic"
             );
+        } else if meta.job_execution.is_some() {
+            tracing::info!(
+                agent = i,
+                job_id = ?meta.job_execution.as_ref().map(|execution| execution.job_id),
+                "dropping panicked delegated-job batch; durable reconciliation owns continuation"
+            );
         } else if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
@@ -4969,9 +5422,11 @@ fn recover_panicked_agent(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_ready_join_results(
+async fn drain_ready_join_results(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
+    rest: &relay::RestClient,
+    queued_job_attempts: &mut HashSet<Uuid>,
     config: &Config,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
@@ -4985,6 +5440,15 @@ fn drain_ready_join_results(
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
+            persist_panicked_job_attempt(
+                pool,
+                queue,
+                rest,
+                queued_job_attempts,
+                join_error.id(),
+                "prompt task panicked while draining ready results",
+            )
+            .await;
             if let Some(evaluation) = recover_panicked_agent(
                 pool,
                 queue,
@@ -5885,7 +6349,53 @@ mod owner_control_command_tests {
     }
 
     #[tokio::test]
-    async fn job_decision_cancels_only_the_matching_evaluation_turn() {
+    async fn active_job_execution_lookup_never_grants_authority_to_generic_conversation() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let job_channel = Uuid::new_v4();
+        let generic_channel = Uuid::new_v4();
+        let execution = job_execution::JobExecutionContext {
+            job_id: Uuid::new_v4(),
+            request_event_id: "ab".repeat(32),
+            attempt_id: Uuid::new_v4(),
+            generation: 1,
+            runnable_event_id: "cd".repeat(32),
+            claim_event_id: "ef".repeat(32),
+            turn_id: "job-turn".into(),
+            lease_until: i64::MAX,
+        };
+        for (channel_id, job_execution) in [
+            (job_channel, Some(execution.clone())),
+            (generic_channel, None),
+        ] {
+            let abort_handle = pool.join_set.spawn(async {});
+            pool.task_map_mut().insert(
+                abort_handle.id(),
+                pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(channel_id),
+                    turn_id: format!("turn-{channel_id}"),
+                    job_execution,
+                    job_evaluation: None,
+                    job_evaluation_decided: false,
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            active_job_execution_for_channel(&pool, job_channel)
+                .map(|context| (context.job_id, context.generation)),
+            Some((execution.job_id, 1))
+        );
+        assert!(active_job_execution_for_channel(&pool, generic_channel).is_none());
+        assert!(active_job_execution_for_channel(&pool, Uuid::new_v4()).is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_job_rotates_a_stale_same_channel_turn_before_claim() {
         let mut pool = AgentPool::from_slots(vec![]);
         let channel_id = Uuid::new_v4();
         let evaluation = job_execution::JobEvaluationContext {
@@ -5914,9 +6424,12 @@ mod owner_control_command_tests {
 
         let mut wrong = evaluation.clone();
         wrong.job_id = Uuid::new_v4();
-        assert!(!signal_job_evaluation_boundary(&mut pool, &wrong));
-        assert!(signal_job_evaluation_boundary(&mut pool, &evaluation));
+        assert!(signal_job_evaluation_boundary(&mut pool, &wrong));
         assert_eq!(control_rx.await.unwrap(), ControlSignal::Rotate);
+        assert!(pool
+            .task_map()
+            .values()
+            .all(|meta| !meta.job_evaluation_decided));
         assert!(!signal_job_evaluation_boundary(&mut pool, &evaluation));
     }
 

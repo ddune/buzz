@@ -46,6 +46,11 @@ impl DevMcp {
         Parameters(p): Parameters<shell::ShellParams>,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if job_followup_readonly() && !followup_shell_command_allowed(&p.command) {
+            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
+                "Shell and process execution are disabled while an accepted job owns the workspace; the durable claimed continuation is the sole mutation-capable authority.",
+            )]));
+        }
         if evaluation_only() && !evaluation_shell_command_allowed(&p.command) {
             return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
                 "Delegated-job evaluation permits only `buzz jobs accept` or `buzz jobs reject`; executable repository work begins in the claimed continuation.",
@@ -84,9 +89,9 @@ impl DevMcp {
         &self,
         Parameters(p): Parameters<str_replace::StrReplaceParams>,
     ) -> Result<String, ErrorData> {
-        if evaluation_only() {
+        if !file_mutation_allowed(evaluation_only(), job_followup_readonly()) {
             return Err(ErrorData::invalid_request(
-                "file mutation is disabled during delegated-job evaluation",
+                "file mutation is disabled in this restricted delegated-job session",
                 None,
             ));
         }
@@ -136,6 +141,119 @@ impl DevMcp {
 
 fn evaluation_only() -> bool {
     std::env::var_os("BUZZ_JOB_EVALUATION_ONLY").is_some()
+}
+
+fn job_followup_readonly() -> bool {
+    std::env::var_os("BUZZ_JOB_FOLLOWUP_READONLY").is_some()
+}
+
+fn followup_shell_command_allowed(command: &str) -> bool {
+    let Ok(expected_channel) = std::env::var("BUZZ_JOB_FOLLOWUP_CHANNEL_ID") else {
+        return false;
+    };
+    followup_shell_command_allowed_for(command, &expected_channel)
+}
+
+fn followup_shell_command_allowed_for(command: &str, expected_channel: &str) -> bool {
+    let Some(words) = restricted_shell_words(command) else {
+        return false;
+    };
+    if words
+        .get(..3)
+        .map(|words| words.iter().map(String::as_str).collect::<Vec<_>>())
+        != Some(vec!["buzz", "messages", "send"])
+    {
+        return false;
+    }
+    if words.len() != 9 {
+        return false;
+    }
+    let mut options = std::collections::HashMap::<&str, &str>::new();
+    for pair in words[3..].chunks_exact(2) {
+        if !matches!(pair[0].as_str(), "--channel" | "--content" | "--reply-to")
+            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return false;
+        }
+    }
+    options.get("--channel").is_some_and(|channel| {
+        channel == &expected_channel && uuid::Uuid::parse_str(channel).is_ok()
+    }) && options
+        .get("--content")
+        .is_some_and(|content| !content.is_empty() && *content != "-")
+        && options.get("--reply-to").is_some_and(|event_id| {
+            event_id.len() == 64 && event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// Parse a single shell command while rejecting operators and expansion. Shell
+/// metacharacters are harmless inside single quotes, which lets ordinary
+/// Markdown status text contain backticks without opening command execution.
+fn restricted_shell_words(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut word = String::new();
+    let mut words = Vec::new();
+    for ch in command.chars() {
+        if matches!(ch, '\n' | '\r') {
+            return None;
+        }
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => escaped = true,
+                '$' | '`' => return None,
+                _ => word.push(ch),
+            },
+            Quote::None => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => escaped = true,
+                // Reject every unquoted shell expansion/operator character,
+                // not just command separators. The validated argv is later
+                // executed by bash, so brace/glob/tilde/history expansion
+                // would otherwise be able to manufacture extra CLI options
+                // after this check (for example `{ok,--file=/etc/passwd}`).
+                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '#' | '{' | '}' | '*' | '?' | '['
+                | ']' | '~' | '(' | ')' | '!' => return None,
+                ch if ch.is_whitespace() => {
+                    if !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(ch),
+            },
+        }
+    }
+    if escaped || !matches!(quote, Quote::None) {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn file_mutation_allowed(evaluation: bool, followup_readonly: bool) -> bool {
+    !evaluation && !followup_readonly
 }
 
 fn evaluation_shell_command_allowed(command: &str) -> bool {
@@ -242,7 +360,10 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
 
 #[cfg(test)]
 mod evaluation_tests {
-    use super::evaluation_shell_command_allowed;
+    use super::{
+        evaluation_shell_command_allowed, file_mutation_allowed, followup_shell_command_allowed,
+        followup_shell_command_allowed_for,
+    };
 
     #[test]
     fn evaluation_shell_allows_only_constrained_job_decisions() {
@@ -267,6 +388,60 @@ mod evaluation_tests {
             assert!(
                 !evaluation_shell_command_allowed(command),
                 "unexpected evaluation command admission: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_job_followup_denies_every_shell_mutation_path() {
+        // The follow-up handler rejects shell before parsing the command. Pin
+        // representative file, Git, process, lifecycle, and MCP escape paths.
+        for command in [
+            "touch marker-b",
+            "git add .",
+            "git commit -m continued",
+            "cargo test",
+            "python -c 'open(\"marker-b\", \"w\").close()'",
+            "buzz jobs complete --job id",
+            "buzz jobs blocked --job id",
+            "buzz jobs delegate --job id",
+        ] {
+            assert!(!followup_shell_command_allowed(command));
+        }
+        assert!(!file_mutation_allowed(false, true));
+        assert!(!file_mutation_allowed(true, false));
+        assert!(file_mutation_allowed(false, false));
+    }
+
+    #[test]
+    fn accepted_job_followup_allows_only_the_threaded_reply_command_shape() {
+        let channel = "00000000-0000-0000-0000-000000000042";
+        let event = "ab".repeat(32);
+        assert!(followup_shell_command_allowed_for(
+            &format!(
+                "buzz messages send --channel {channel} --content 'Work on `marker-a.txt` is checkpointed.' --reply-to {event}"
+            ),
+            channel,
+        ));
+        for command in [
+            format!("buzz messages send --channel {channel} --content - --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content ok"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --file secret"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --file=secret"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --kind=9"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to not-an-event"),
+            format!("buzz messages send --channel {channel} --content ok # --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content {{ok,--file=/etc/hostname}} --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content * --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content ok --reply-to {event} --reply-to {event}"),
+            format!("buzz messages send --channel not-a-uuid --content ok --reply-to {event}"),
+            format!("buzz messages send --channel 00000000-0000-0000-0000-000000000099 --content ok --reply-to {event}"),
+            format!("buzz messages send --channel {channel} --content 'ok'; touch marker --reply-to {event}"),
+            "buzz jobs complete --job id".into(),
+        ] {
+            assert!(
+                !followup_shell_command_allowed_for(&command, channel),
+                "admitted: {command}"
             );
         }
     }

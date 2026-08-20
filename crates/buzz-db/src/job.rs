@@ -213,6 +213,95 @@ pub async fn get_job(
     row.map(row_to_record).transpose()
 }
 
+/// Atomically validate and persist one accepted-job supplemental admission.
+pub async fn accept_supplemental_context(
+    pool: &PgPool,
+    community: CommunityId,
+    event: &Event,
+    supplemental: &buzz_core::supplemental_context::SupplementalContextEvent,
+) -> Result<JobWriteOutcome, JobWriteError> {
+    let mut tx = pool.begin().await?;
+    lock_job(&mut tx, community, supplemental.job_id).await?;
+    if event_exists(&mut tx, community, event).await? {
+        tx.rollback().await?;
+        return Ok(replay_outcome(event, supplemental.channel_id));
+    }
+    let job = load_job_for_update(&mut tx, community, supplemental.job_id)
+        .await?
+        .ok_or_else(|| JobWriteError::Rejected("unknown job ID".into()))?;
+    if job.state != JobState::Accepted {
+        return Err(JobWriteError::Rejected(
+            "supplemental context requires an accepted non-terminal job".into(),
+        ));
+    }
+    if job.request_event_id != hex::decode(&supplemental.request_event_id).unwrap_or_default()
+        || job.channel_id != supplemental.channel_id
+        || job.target_agent != event.pubkey.to_bytes().as_slice()
+    {
+        return Err(JobWriteError::Rejected(
+            "supplemental context changed immutable job request, target, or channel".into(),
+        ));
+    }
+
+    let source_id = hex::decode(&supplemental.source_event_id).unwrap_or_default();
+    let source_author = hex::decode(&supplemental.source_author).unwrap_or_default();
+    let source = sqlx::query(
+        "SELECT kind,channel_id,pubkey,content FROM events \
+         WHERE community_id=$1 AND id=$2 FOR SHARE",
+    )
+    .bind(community.as_uuid())
+    .bind(source_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| JobWriteError::Rejected("unknown supplemental source event".into()))?;
+    let source_channel: Option<Uuid> = source.try_get("channel_id")?;
+    let source_kind: i32 = source.try_get("kind")?;
+    let stored_author: Vec<u8> = source.try_get("pubkey")?;
+    let stored_content: String = source.try_get("content")?;
+    if source_kind != buzz_core::kind::KIND_STREAM_MESSAGE as i32
+        || source_channel != Some(supplemental.channel_id)
+        || stored_author != source_author
+        || stored_content != supplemental.content
+    {
+        return Err(JobWriteError::Rejected(
+            "supplemental source event kind, channel, author, or content mismatch".into(),
+        ));
+    }
+
+    let latest_generation: Option<i64> = sqlx::query_scalar(
+        "SELECT max(generation) FROM job_execution_attempts \
+         WHERE community_id=$1 AND job_id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(supplemental.job_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let generation_is_adjacent = match latest_generation {
+        None => supplemental.continuation_generation == 1,
+        Some(latest) => {
+            supplemental.continuation_generation == latest
+                || supplemental.continuation_generation == latest.saturating_add(1)
+        }
+    };
+    if !generation_is_adjacent {
+        return Err(JobWriteError::Rejected(
+            "supplemental context targets a non-adjacent continuation generation".into(),
+        ));
+    }
+
+    let created_at = event_timestamp(event)?;
+    insert_event(
+        &mut tx,
+        community,
+        event,
+        supplemental.channel_id,
+        created_at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(inserted_outcome(event, supplemental.channel_id))
+}
+
 /// List jobs targeting one agent, optionally limited to accepted non-terminal work.
 pub async fn list_jobs_for_agent(
     pool: &PgPool,
@@ -676,6 +765,115 @@ mod tests {
                 .state,
             JobState::Completed | JobState::Blocked
         ));
+        cleanup(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn supplemental_context_requires_exact_accepted_job_and_source_event() {
+        let (pool, community, channel) = fixture().await;
+        let requester = Keys::generate();
+        let target = Keys::generate();
+        let source_author = Keys::generate();
+        let job = Uuid::new_v4();
+        let request = request_event(&requester, &target, job, channel, "bounded assignment");
+        accept_request(
+            &pool,
+            community,
+            &request,
+            &parse_job_request(&request).expect("request parse"),
+        )
+        .await
+        .expect("request");
+        let accepted = lifecycle_event(
+            &target,
+            buzz_core::kind::KIND_JOB_ACCEPTED,
+            job,
+            &request,
+            &request,
+            channel,
+        );
+        accept_lifecycle(
+            &pool,
+            community,
+            &accepted,
+            &parse_job_lifecycle(&accepted).expect("accept parse"),
+        )
+        .await
+        .expect("accept");
+
+        let source = EventBuilder::new(Kind::Custom(9), "status?")
+            .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
+            .sign_with_keys(&source_author)
+            .expect("source");
+        let wrong_kind_source = EventBuilder::new(Kind::TextNote, "status?")
+            .tags([Tag::parse(["h", &channel.to_string()]).expect("tag")])
+            .sign_with_keys(&source_author)
+            .expect("wrong-kind source");
+        let mut tx = pool.begin().await.expect("source transaction");
+        for event in [&source, &wrong_kind_source] {
+            insert_event(
+                &mut tx,
+                community,
+                event,
+                channel,
+                event_timestamp(event).expect("timestamp"),
+            )
+            .await
+            .expect("source insert");
+        }
+        tx.commit().await.expect("source commit");
+
+        let supplemental = |source: &Event, author_hex: String| {
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_JOB_SUPPLEMENTAL_CONTEXT as u16),
+                serde_json::json!({"content":"status?"}).to_string(),
+            )
+            .tags([
+                Tag::parse(["d", &job.to_string()]).expect("tag"),
+                Tag::parse(["job-request", &request.id.to_hex()]).expect("tag"),
+                Tag::parse(["job-target", &target.public_key().to_hex()]).expect("tag"),
+                Tag::parse(["h", &channel.to_string()]).expect("tag"),
+                Tag::parse(["supplemental-event", &source.id.to_hex()]).expect("tag"),
+                Tag::parse(["supplemental-author", &author_hex]).expect("tag"),
+                Tag::parse(["continuation-generation", "1"]).expect("tag"),
+            ])
+            .sign_with_keys(&target)
+            .expect("supplemental")
+        };
+
+        let wrong = supplemental(&source, Keys::generate().public_key().to_hex());
+        let wrong_parsed = buzz_core::supplemental_context::parse_supplemental_context(&wrong)
+            .expect("structural parse");
+        assert!(matches!(
+            accept_supplemental_context(&pool, community, &wrong, &wrong_parsed).await,
+            Err(JobWriteError::Rejected(_))
+        ));
+
+        let wrong_kind = supplemental(&wrong_kind_source, source_author.public_key().to_hex());
+        let wrong_kind_parsed =
+            buzz_core::supplemental_context::parse_supplemental_context(&wrong_kind)
+                .expect("wrong kind source has structurally valid admission");
+        assert!(matches!(
+            accept_supplemental_context(&pool, community, &wrong_kind, &wrong_kind_parsed).await,
+            Err(JobWriteError::Rejected(_))
+        ));
+
+        let valid = supplemental(&source, source_author.public_key().to_hex());
+        let valid_parsed = buzz_core::supplemental_context::parse_supplemental_context(&valid)
+            .expect("valid parse");
+        assert!(
+            accept_supplemental_context(&pool, community, &valid, &valid_parsed)
+                .await
+                .expect("valid admission")
+                .was_inserted
+        );
+        assert!(
+            !accept_supplemental_context(&pool, community, &valid, &valid_parsed)
+                .await
+                .expect("idempotent replay")
+                .was_inserted
+        );
         cleanup(&pool, community).await;
     }
 }

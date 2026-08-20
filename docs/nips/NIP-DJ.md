@@ -2,7 +2,7 @@
 
 ## Status
 
-Buzz extension. Normative for delegated executable work represented by kinds `43001–43007`.
+Buzz extension. Normative for delegated executable work represented by kinds `43001–43008`.
 
 ## Purpose and boundary
 
@@ -21,6 +21,7 @@ An accepted delegated job is the structural input from which BTOM may create a d
 | `43005` | `KIND_JOB_BLOCKED` | Accepted job blocked; terminal |
 | `43006` | `KIND_JOB_DELEGATED` | Accepted job delegated/transferred; terminal |
 | `43007` | `KIND_JOB_EXECUTION_ATTEMPT` | Runtime attempt/continuation metadata subordinate to an accepted job |
+| `43008` | `KIND_JOB_SUPPLEMENTAL_CONTEXT` | Target admission of one exact source message for a continuation generation |
 
 All events are regular append-only stored events. The relay materializes the current state transactionally for deterministic queries and restart recovery; lifecycle history remains in the signed event log.
 
@@ -74,6 +75,14 @@ The relay serializes attempt changes under the delegated job's community/job adv
 
 Normal ACP return, `EndTurn`, stop, cancellation, cancel-and-merge, session replacement, worker loss, teardown, max-turn exhaustion, timeout, and recoverable provider failure are attempt outcomes only. If the job remains accepted, reconciliation creates exactly one next runnable generation. Only kinds `43004`, `43005`, and `43006` provide terminal BTOM disposition.
 
+## Supplemental context (`43008`)
+
+When an admitted ordinary message arrives while an accepted job owns the channel, ACP signs a supplemental-context event before the message can affect a runtime session. Required tags are `d`, `job-request`, `job-target`, `h`, `supplemental-event`, `supplemental-author`, and positive `continuation-generation`, each exactly once with two elements. JSON content contains one `content` string copied from the source event.
+
+The relay accepts the event only from the accepted job target, while the job remains accepted, with immutable request/channel coordinates. The exact source event must already exist in the same channel and its author and content must match. The target generation must be the current or immediately succeeding generation. These events are append-only control evidence and are not conversational input.
+
+An optional conversational reply to an admitted source message runs in a fresh mutation-restricted follow-up session. Its only write surface is an ordinary threaded reply: the bundled broker permits the exact `buzz messages send --channel ... --content ... --reply-to ...` command shape, and the CLI revalidates that the reply target has a target-authored `43008` admission tied to a currently accepted job before every send. The broker has no lifecycle, shell-mutation, file-edit, process, Git, or configured/native MCP capability. Hermes reuses one broker registration per channel: its static channel fence prevents cross-channel authority, while durable per-message validation allows native steering to add another admitted reply ID without creating a process for every batch. Supplemental content remains available to the next durable generation whether or not the optional conversational reply succeeds.
+
 ## State machine
 
 | Current | Event | Next |
@@ -113,7 +122,7 @@ Because both history and current state are durable, a relay or ACP restart recon
 
 `buzz-acp` includes targeted `43001` delivery as an invariant control-plane subscription for every discovered member channel, independent of conversational kind overrides and config rules. It validates that `job-target` is its own identity and places requests only in job-class runtime batches. It presents explicit `buzz jobs accept` and `buzz jobs reject` commands. Lifecycle events are control-plane state and never enter conversational dispatch.
 
-The request-evaluation turn runs in a fresh restricted session. Buzz supplies the ACP `_meta.hermes.toolProfile = "decision-only"` capability-reduction extension; compatible Hermes adapters omit their native and configured toolsets for that session, then register only Buzz's explicitly supplied MCP server. Unknown MCP servers, native terminal/code/delegation/browser tools, general shell execution, and file mutation are therefore unavailable. The bundled MCP permits read-only inspection plus only the constrained `buzz jobs accept` or `buzz jobs reject` shell command. Ordinary conversation and claimed execution sessions omit the reduction profile and retain their configured tool surfaces.
+The request-evaluation turn runs in a fresh restricted session. Buzz supplies the ACP `_meta.hermes.toolProfile = "decision-only"` capability-reduction extension; compatible Hermes adapters omit their native and configured toolsets for that session, then register only Buzz's explicitly supplied MCP server. Unknown MCP servers, native terminal/code/delegation/browser tools, general shell execution, and file mutation are therefore unavailable. The bundled MCP permits read-only inspection plus only the constrained `buzz jobs accept` or `buzz jobs reject` shell command. Follow-up sessions for an active accepted job use the separately restricted surface described above. Ordinary conversation with no active job and durably claimed execution sessions omit the reduction profile and retain their configured tool surfaces.
 
 The target's matching acceptance or rejection rotates the restricted session away. ACP-launched MCP servers mark the constrained CLI environment so a successfully persisted decision call does not return control to the model; if lifecycle observation is delayed, the tool call remains pending and therefore fails closed. Acceptance records an exact-job promotion obligation. After the cancelled evaluation result clears the channel's in-flight state, Buzz reconciles that job through the same canonical state machine used by startup and periodic recovery, using the immutable `d` coordinate to avoid unrelated pagination. Accepted work receives a new unrestricted turn only after generation one has both a persisted `runnable` event and a persisted `claim` event. Periodic reconciliation remains crash/restart recovery; an evaluation that ends without a matching durable decision retains normal retry behavior. The request-evaluation turn is never itself an execution attempt.
 

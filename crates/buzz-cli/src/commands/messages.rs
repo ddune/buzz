@@ -1,6 +1,13 @@
 use buzz_sdk::{DeleteMessageOptions, DiffMeta, ThreadRef, VoteDirection};
-use nostr::PublicKey;
+use nostr::{Event, PublicKey};
 use uuid::Uuid;
+
+use buzz_core::delegated_job::{parse_job_lifecycle, parse_job_request, JobState};
+use buzz_core::kind::{
+    KIND_JOB_ACCEPTED, KIND_JOB_BLOCKED, KIND_JOB_COMPLETED, KIND_JOB_DELEGATED, KIND_JOB_REJECTED,
+    KIND_JOB_REQUEST, KIND_JOB_SUPPLEMENTAL_CONTEXT,
+};
+use buzz_core::supplemental_context::parse_supplemental_context;
 
 use crate::client::{normalize_events, normalize_write_response, BuzzClient};
 use crate::error::CliError;
@@ -571,10 +578,182 @@ pub struct SendMessageParams {
     pub mentions: Vec<String>,
 }
 
+fn job_followup_readonly() -> bool {
+    std::env::var_os("BUZZ_JOB_FOLLOWUP_READONLY").is_some()
+}
+
+fn validate_followup_reply_shape(p: &SendMessageParams) -> Result<(), CliError> {
+    if p.kind.is_some()
+        || p.reply_to.is_none()
+        || p.broadcast
+        || !p.files.is_empty()
+        || !p.mentions.is_empty()
+        || p.content == "-"
+        || p.content.is_empty()
+    {
+        return Err(CliError::Usage(
+            "accepted-job follow-up authority permits only a non-empty, threaded ordinary reply"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_followup_channel_scope(channel_id: Uuid) -> Result<(), CliError> {
+    let expected = std::env::var("BUZZ_JOB_FOLLOWUP_CHANNEL_ID").map_err(|_| {
+        CliError::Usage("accepted-job follow-up channel authority is unavailable".into())
+    })?;
+    if Uuid::parse_str(&expected).ok() != Some(channel_id) {
+        return Err(CliError::Usage(
+            "accepted-job follow-up cannot reply outside its channel".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn project_followup_reply_authority(
+    admission_events: Vec<Event>,
+    job_events: Vec<Event>,
+    channel_id: Uuid,
+    reply_to: &str,
+    signer: &str,
+) -> Result<(), CliError> {
+    let mut admissions = admission_events.into_iter().filter_map(|event| {
+        let admission = parse_supplemental_context(&event).ok()?;
+        (admission.channel_id == channel_id
+            && admission.source_event_id == reply_to
+            && admission.target_agent == signer
+            && event.pubkey.to_hex() == signer)
+            .then_some(admission)
+    });
+    let admission = admissions.next().ok_or_else(|| {
+        CliError::Usage("reply target has no durable accepted-job admission".into())
+    })?;
+    if admissions.next().is_some() {
+        return Err(CliError::Usage(
+            "reply target has ambiguous accepted-job admissions".into(),
+        ));
+    }
+
+    let mut request = None;
+    let mut lifecycles = Vec::new();
+    for event in job_events {
+        if event.id.to_hex() == admission.request_event_id {
+            if request.is_some() {
+                return Err(CliError::Usage("duplicate delegated-job request".into()));
+            }
+            request = parse_job_request(&event).ok();
+        } else if let Ok(lifecycle) = parse_job_lifecycle(&event) {
+            lifecycles.push((event.id.to_hex(), lifecycle));
+        }
+    }
+    let request =
+        request.ok_or_else(|| CliError::Usage("delegated-job request not found".into()))?;
+    if request.job_id != admission.job_id
+        || request.request_event_id != admission.request_event_id
+        || request.channel_id != channel_id
+        || request.target_agent != signer
+    {
+        return Err(CliError::Usage(
+            "supplemental admission does not match its delegated job".into(),
+        ));
+    }
+
+    let mut state = JobState::Requested;
+    let mut head = request.request_event_id.clone();
+    loop {
+        let candidates: Vec<_> = lifecycles
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, lifecycle))| {
+                lifecycle.job_id == request.job_id
+                    && lifecycle.request_event_id == request.request_event_id
+                    && lifecycle.channel_id == channel_id
+                    && lifecycle.author == signer
+                    && lifecycle.parent_event_id == head
+            })
+            .collect();
+        if candidates.is_empty() {
+            break;
+        }
+        if candidates.len() != 1 {
+            return Err(CliError::Usage(
+                "delegated-job lifecycle is forked or ambiguous".into(),
+            ));
+        }
+        let index = candidates[0].0;
+        let event_id = candidates[0].1 .0.clone();
+        let action = candidates[0].1 .1.action;
+        state = state.apply(action).map_err(|error| {
+            CliError::Usage(format!("invalid delegated-job lifecycle: {error}"))
+        })?;
+        head = event_id;
+        lifecycles.remove(index);
+    }
+    if state != JobState::Accepted {
+        return Err(CliError::Usage(
+            "follow-up reply authority requires an accepted non-terminal job".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_followup_reply_authority(
+    client: &BuzzClient,
+    channel_id: Uuid,
+    reply_to: &str,
+) -> Result<(), CliError> {
+    let signer = client.keys().public_key().to_hex();
+    let admission_values = client
+        .query_all(serde_json::json!({
+            "kinds": [KIND_JOB_SUPPLEMENTAL_CONTEXT],
+            "authors": [signer],
+            "#h": [channel_id.to_string()],
+            "#supplemental-event": [reply_to]
+        }))
+        .await?;
+    let admission_events: Vec<Event> = admission_values
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| CliError::Other(format!("invalid supplemental event: {error}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let job_ids: Vec<String> = admission_events
+        .iter()
+        .filter_map(|event| parse_supplemental_context(event).ok())
+        .map(|admission| admission.job_id.to_string())
+        .collect();
+    if job_ids.is_empty() {
+        return Err(CliError::Usage(
+            "reply target has no durable accepted-job admission".into(),
+        ));
+    }
+    let job_values = client
+        .query_all(serde_json::json!({
+            "kinds": [KIND_JOB_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_REJECTED,
+                      KIND_JOB_COMPLETED, KIND_JOB_BLOCKED, KIND_JOB_DELEGATED],
+            "#d": job_ids
+        }))
+        .await?;
+    let job_events = job_values
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| CliError::Other(format!("invalid delegated-job event: {error}")))
+        })
+        .collect::<Result<_, _>>()?;
+    project_followup_reply_authority(admission_events, job_events, channel_id, reply_to, &signer)
+}
+
 pub async fn cmd_send_message(
     client: &BuzzClient,
     mut p: SendMessageParams,
 ) -> Result<(), CliError> {
+    let restricted_followup = job_followup_readonly();
+    if restricted_followup {
+        validate_followup_reply_shape(&p)?;
+    }
     // Allow '-' to read content from stdin. This keeps callers from having to
     // jam shell-metacharacter-heavy text (backticks, $vars, etc.) through argv
     // quoting — the source of countless self-inflicted command-substitution
@@ -585,6 +764,15 @@ pub async fn cmd_send_message(
         validate_hex64(r)?;
     }
     let channel_uuid = parse_uuid(&p.channel_id)?;
+    if restricted_followup {
+        validate_followup_channel_scope(channel_uuid)?;
+        validate_followup_reply_authority(
+            client,
+            channel_uuid,
+            p.reply_to.as_deref().expect("shape validated reply target"),
+        )
+        .await?;
+    }
 
     let explicit_mentions = normalize_explicit_mentions(&p.mentions)?;
     let stripped = strip_code_regions(&p.content);
@@ -995,12 +1183,18 @@ mod tests {
     use super::{
         event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
         missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys,
+        project_followup_reply_authority, resolve_names_to_pubkeys, validate_followup_reply_shape,
+        SendMessageParams,
+    };
+    use buzz_core::kind::{
+        KIND_JOB_ACCEPTED, KIND_JOB_COMPLETED, KIND_JOB_REQUEST, KIND_JOB_SUPPLEMENTAL_CONTEXT,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
     };
+    use nostr::{Event, EventBuilder, Keys, Kind, Tag};
     use serde_json::json;
+    use uuid::Uuid;
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1011,6 +1205,117 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    fn followup_authority_events(terminal: bool) -> (Vec<Event>, Vec<Event>, Uuid, String, String) {
+        let requester = Keys::generate();
+        let target = Keys::generate();
+        let target_hex = target.public_key().to_hex();
+        let job_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let source_id = "ab".repeat(32);
+        let request = EventBuilder::new(Kind::Custom(KIND_JOB_REQUEST as u16), "bounded work")
+            .tags([
+                Tag::parse(["d", &job_id.to_string()]).unwrap(),
+                Tag::parse(["job-target", &target_hex]).unwrap(),
+                Tag::parse(["p", &target_hex]).unwrap(),
+                Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&requester)
+            .unwrap();
+        let request_id = request.id.to_hex();
+        let accepted = EventBuilder::new(Kind::Custom(KIND_JOB_ACCEPTED as u16), "accepted")
+            .tags([
+                Tag::parse(["d", &job_id.to_string()]).unwrap(),
+                Tag::parse(["job-request", &request_id]).unwrap(),
+                Tag::parse(["job-parent", &request_id]).unwrap(),
+                Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&target)
+            .unwrap();
+        let admission = EventBuilder::new(
+            Kind::Custom(KIND_JOB_SUPPLEMENTAL_CONTEXT as u16),
+            serde_json::json!({"content":"status?"}).to_string(),
+        )
+        .tags([
+            Tag::parse(["d", &job_id.to_string()]).unwrap(),
+            Tag::parse(["job-request", &request_id]).unwrap(),
+            Tag::parse(["job-target", &target_hex]).unwrap(),
+            Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            Tag::parse(["supplemental-event", &source_id]).unwrap(),
+            Tag::parse(["supplemental-author", &requester.public_key().to_hex()]).unwrap(),
+            Tag::parse(["continuation-generation", "2"]).unwrap(),
+        ])
+        .sign_with_keys(&target)
+        .unwrap();
+        let mut jobs = vec![request, accepted.clone()];
+        if terminal {
+            jobs.push(
+                EventBuilder::new(Kind::Custom(KIND_JOB_COMPLETED as u16), "done")
+                    .tags([
+                        Tag::parse(["d", &job_id.to_string()]).unwrap(),
+                        Tag::parse(["job-request", &request_id]).unwrap(),
+                        Tag::parse(["job-parent", &accepted.id.to_hex()]).unwrap(),
+                        Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                    ])
+                    .sign_with_keys(&target)
+                    .unwrap(),
+            );
+        }
+        (vec![admission], jobs, channel_id, source_id, target_hex)
+    }
+
+    #[test]
+    fn restricted_followup_shape_excludes_every_non_reply_surface() {
+        let valid = SendMessageParams {
+            channel_id: Uuid::new_v4().to_string(),
+            content: "brief status".into(),
+            kind: None,
+            reply_to: Some("ab".repeat(32)),
+            broadcast: false,
+            files: vec![],
+            mentions: vec![],
+        };
+        assert!(validate_followup_reply_shape(&valid).is_ok());
+        let mut invalid = valid;
+        invalid.files.push("secret".into());
+        assert!(validate_followup_reply_shape(&invalid).is_err());
+    }
+
+    #[test]
+    fn restricted_followup_reply_requires_a_durable_current_acceptance() {
+        let (admissions, jobs, channel, source, target) = followup_authority_events(false);
+        assert!(project_followup_reply_authority(
+            admissions.clone(),
+            jobs.clone(),
+            Uuid::new_v4(),
+            &source,
+            &target,
+        )
+        .is_err());
+        assert!(project_followup_reply_authority(
+            admissions.clone(),
+            jobs,
+            channel,
+            &source,
+            &target,
+        )
+        .is_ok());
+        let (
+            terminal_admissions,
+            terminal_jobs,
+            terminal_channel,
+            terminal_source,
+            terminal_target,
+        ) = followup_authority_events(true);
+        assert!(project_followup_reply_authority(
+            terminal_admissions,
+            terminal_jobs,
+            terminal_channel,
+            &terminal_source,
+            &terminal_target,
+        )
+        .is_err());
+    }
 
     #[test]
     fn root_marker_wins_over_reply_marker() {

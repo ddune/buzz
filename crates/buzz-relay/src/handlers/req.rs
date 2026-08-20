@@ -1022,7 +1022,7 @@ fn filter_to_query_params(
         !ks.is_empty()
             && ks.iter().all(|&k| {
                 buzz_core::kind::is_parameterized_replaceable(k as u32)
-                    || matches!(k as u32, 43001..=43007)
+                    || matches!(k as u32, 43001..=43008)
             })
     });
     let d_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::D);

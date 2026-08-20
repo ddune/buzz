@@ -2815,6 +2815,16 @@ impl Db {
         execution_attempt::accept(&self.pool, community_id, event, attempt).await
     }
 
+    /// Atomically validate and persist one accepted-job supplemental admission.
+    pub async fn accept_job_supplemental_context(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        supplemental: &buzz_core::supplemental_context::SupplementalContextEvent,
+    ) -> std::result::Result<job::JobWriteOutcome, job::JobWriteError> {
+        job::accept_supplemental_context(&self.pool, community_id, event, supplemental).await
+    }
+
     /// Fetch the current durable state of one delegated job.
     pub async fn get_job(
         &self,

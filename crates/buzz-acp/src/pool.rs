@@ -1013,7 +1013,32 @@ struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
     id: Option<Uuid>,
     channel_type: Option<&'a str>,
-    job_evaluation: bool,
+    capability_profile: SessionCapabilityProfile,
+    followup_reply_event_ids: &'a [String],
+}
+
+/// Capability authority selected structurally from the queued batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCapabilityProfile {
+    Ordinary,
+    JobDecision,
+    JobFollowupReadonly,
+    JobExecution,
+}
+
+impl SessionCapabilityProfile {
+    fn strips_native_tools(self) -> bool {
+        matches!(self, Self::JobDecision | Self::JobFollowupReadonly)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::JobDecision => "job-decision",
+            Self::JobFollowupReadonly => "job-followup-readonly",
+            Self::JobExecution => "job-execution",
+        }
+    }
 }
 
 async fn create_session_and_apply_model(
@@ -1052,7 +1077,8 @@ async fn create_session_and_apply_model(
         channel.id,
         channel.channel_type,
         ctx.session_title.as_deref(),
-        channel.job_evaluation,
+        channel.capability_profile,
+        channel.followup_reply_event_ids,
     );
 
     let resp = agent
@@ -1067,7 +1093,10 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
-            channel.job_evaluation.then_some("decision-only"),
+            channel
+                .capability_profile
+                .strips_native_tools()
+                .then_some("decision-only"),
         )
         .await?;
 
@@ -1283,36 +1312,52 @@ fn mcp_servers_with_git_origin(
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
     agent_name: Option<&str>,
-    job_evaluation: bool,
+    capability_profile: SessionCapabilityProfile,
+    _followup_reply_event_ids: &[String],
 ) -> Vec<McpServer> {
     let mut servers = servers.to_vec();
-    if job_evaluation {
+    if capability_profile.strips_native_tools() {
         // Unknown MCP servers may expose mutations and cannot be trusted to
-        // honor Buzz's evaluation-only environment. Keep only the bundled
-        // server whose handlers enforce the restricted tool boundary.
+        // honor Buzz's restricted-session environment. Keep only the bundled
+        // server whose handlers enforce the selected tool boundary.
         servers.retain(|server| server.command == "buzz-dev-mcp");
         // Hermes registers ACP-provided MCP processes globally by server name
         // and intentionally treats a repeated name as an idempotent lookup.
-        // Give the fail-closed evaluation process its own registry identity so
-        // a later execution session cannot reuse its evaluation-only
-        // environment. The executable identity remains exact and trusted; only
-        // the ACP registration name is separated from normal execution.
+        // Decision and follow-up processes have registry identities separate
+        // from normal execution. The follow-up broker is deliberately stable;
+        // per-reply authority is checked dynamically by the CLI below it.
         for server in &mut servers {
-            server.name = "buzz-dev-mcp-job-decision".into();
+            server.name = match capability_profile {
+                SessionCapabilityProfile::JobDecision => "buzz-dev-mcp-job-decision".into(),
+                // Hermes cannot pass the invoking ACP session identity to a
+                // process-global MCP server. Scope one reusable broker to the
+                // channel instead: native steering in that channel can admit
+                // new reply IDs, while a session in channel A cannot invoke
+                // reply authority for channel B.
+                SessionCapabilityProfile::JobFollowupReadonly => format!(
+                    "buzz-dev-mcp-job-followup-{}",
+                    channel_id.map_or_else(|| "unscoped".into(), |channel| channel.to_string())
+                ),
+                _ => server.name.clone(),
+            };
         }
     }
-    let origin = match (channel_id, channel_type) {
-        (Some(channel_id), Some("stream")) => Some(EnvVar {
+    let origin = match (capability_profile, channel_id, channel_type) {
+        // The process-global follow-up broker must not retain the channel from
+        // its first session. Every send carries an explicit channel and is
+        // authorized dynamically against the durable admission.
+        (SessionCapabilityProfile::JobFollowupReadonly, _, _) => None,
+        (_, Some(channel_id), Some("stream")) => Some(EnvVar {
             name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
             value: channel_id.to_string(),
         }),
-        (Some(_), _) => agent_name
+        (_, Some(_), _) => agent_name
             .filter(|name| !name.trim().is_empty())
             .map(|name| EnvVar {
                 name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
                 value: name.trim().to_string(),
             }),
-        (None, _) => None,
+        (_, None, _) => None,
     };
     if let Some(origin) = origin {
         for server in &mut servers {
@@ -1326,17 +1371,36 @@ fn mcp_servers_with_git_origin(
     // continuing as an untracked execution attempt.
     for server in &mut servers {
         server.env.retain(|entry| {
-            entry.name != "BUZZ_ACP_JOB_DECISION_YIELD" && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
+            entry.name != "BUZZ_ACP_JOB_DECISION_YIELD"
+                && entry.name != "BUZZ_JOB_EVALUATION_ONLY"
+                && entry.name != "BUZZ_JOB_FOLLOWUP_READONLY"
+                && entry.name != "BUZZ_JOB_FOLLOWUP_CHANNEL_ID"
+                && entry.name != "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS"
         });
-        if job_evaluation {
-            server.env.push(EnvVar {
-                name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
-                value: "1".into(),
-            });
-            server.env.push(EnvVar {
-                name: "BUZZ_JOB_EVALUATION_ONLY".into(),
-                value: "1".into(),
-            });
+        match capability_profile {
+            SessionCapabilityProfile::JobDecision => {
+                server.env.push(EnvVar {
+                    name: "BUZZ_ACP_JOB_DECISION_YIELD".into(),
+                    value: "1".into(),
+                });
+                server.env.push(EnvVar {
+                    name: "BUZZ_JOB_EVALUATION_ONLY".into(),
+                    value: "1".into(),
+                });
+            }
+            SessionCapabilityProfile::JobFollowupReadonly => {
+                server.env.push(EnvVar {
+                    name: "BUZZ_JOB_FOLLOWUP_READONLY".into(),
+                    value: "1".into(),
+                });
+                if let Some(channel_id) = channel_id {
+                    server.env.push(EnvVar {
+                        name: "BUZZ_JOB_FOLLOWUP_CHANNEL_ID".into(),
+                        value: channel_id.to_string(),
+                    });
+                }
+            }
+            SessionCapabilityProfile::Ordinary | SessionCapabilityProfile::JobExecution => {}
         }
     }
     servers
@@ -1830,6 +1894,35 @@ pub async fn run_prompt_task(
                 && crate::job_execution::from_prompt_tag(&event.prompt_tag).is_none()
         })
     });
+    let job_followup_readonly = batch.as_ref().is_some_and(|batch| {
+        !batch.events.is_empty()
+            && batch.events.iter().all(|event| {
+                crate::job_execution::followup_from_prompt_tag(&event.prompt_tag).is_some()
+            })
+    });
+    let job_execution = batch.as_ref().is_some_and(|batch| {
+        !batch.events.is_empty()
+            && batch
+                .events
+                .iter()
+                .all(|event| crate::job_execution::from_prompt_tag(&event.prompt_tag).is_some())
+    });
+    let capability_profile = if job_evaluation {
+        SessionCapabilityProfile::JobDecision
+    } else if job_followup_readonly {
+        SessionCapabilityProfile::JobFollowupReadonly
+    } else if job_execution {
+        SessionCapabilityProfile::JobExecution
+    } else {
+        SessionCapabilityProfile::Ordinary
+    };
+    let followup_reply_event_ids: Vec<String> = batch
+        .as_ref()
+        .filter(|_| job_followup_readonly)
+        .into_iter()
+        .flat_map(|batch| batch.events.iter())
+        .map(|event| event.event.id.to_hex())
+        .collect();
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.channel_id),
@@ -1839,10 +1932,10 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
-    if job_evaluation {
-        // Evaluation must never inherit an unrestricted MCP session. A fresh
-        // session receives an evaluation-only tool environment; the decision
-        // boundary rotates it away before claimed execution is dispatched.
+    if !matches!(capability_profile, SessionCapabilityProfile::Ordinary) {
+        // Every authority transition gets a fresh session. Restricted turns
+        // must never inherit an unrestricted session, and a claimed execution
+        // must never reuse the stripped follow-up/decision surface.
         agent.state.invalidate(&source);
     }
     let turn_started_at = chrono::Utc::now().to_rfc3339();
@@ -2057,7 +2150,8 @@ pub async fn run_prompt_task(
                         name: title_channel.as_deref(),
                         id: Some(*cid),
                         channel_type: origin_channel_type.as_deref(),
-                        job_evaluation,
+                        capability_profile,
+                        followup_reply_event_ids: &followup_reply_event_ids,
                     },
                 )
                 .await
@@ -2123,7 +2217,8 @@ pub async fn run_prompt_task(
                         name: None,
                         id: None,
                         channel_type: None,
-                        job_evaluation: false,
+                        capability_profile: SessionCapabilityProfile::Ordinary,
+                        followup_reply_event_ids: &[],
                     },
                 )
                 .await
@@ -2180,6 +2275,7 @@ pub async fn run_prompt_task(
         serde_json::json!({
             "sessionId": session_id,
             "isNewSession": is_new_session,
+            "capabilityProfile": capability_profile.as_str(),
         }),
     );
 
@@ -4814,7 +4910,8 @@ mod tests {
             Some(channel_id),
             Some("stream"),
             None,
-            false,
+            SessionCapabilityProfile::Ordinary,
+            &[],
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
@@ -4836,7 +4933,8 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("dm"),
             Some("Builder"),
-            false,
+            SessionCapabilityProfile::Ordinary,
+            &[],
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
@@ -4864,7 +4962,8 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
-            true,
+            SessionCapabilityProfile::JobDecision,
+            &[],
         );
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].command, "buzz-dev-mcp");
@@ -4884,14 +4983,16 @@ mod tests {
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
-            true,
+            SessionCapabilityProfile::JobDecision,
+            &[],
         );
         let execution = mcp_servers_with_git_origin(
             &[test_mcp_server()],
             Some(Uuid::new_v4()),
             Some("stream"),
             None,
-            false,
+            SessionCapabilityProfile::JobExecution,
+            &[],
         );
 
         assert_eq!(evaluation[0].command, execution[0].command);
@@ -4901,6 +5002,73 @@ mod tests {
             assert!(evaluation[0].env.iter().any(|entry| entry.name == name));
             assert!(!execution[0].env.iter().any(|entry| entry.name == name));
         }
+    }
+
+    #[test]
+    fn job_followup_keeps_only_readonly_bundled_mcp() {
+        let mut unknown = test_mcp_server();
+        unknown.name = "external".into();
+        unknown.command = "external-mcp".into();
+        let channel = Uuid::new_v4();
+        let reply_ids = vec!["ab".repeat(32), "cd".repeat(32)];
+        let servers = mcp_servers_with_git_origin(
+            &[test_mcp_server(), unknown],
+            Some(channel),
+            Some("stream"),
+            None,
+            SessionCapabilityProfile::JobFollowupReadonly,
+            &reply_ids,
+        );
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].name,
+            format!("buzz-dev-mcp-job-followup-{channel}")
+        );
+        assert!(servers[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_READONLY" && entry.value == "1"));
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_JOB_FOLLOWUP_CHANNEL_ID" && entry.value == channel.to_string()
+        }));
+        assert!(!servers[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_JOB_FOLLOWUP_REPLY_EVENT_IDS"));
+        for name in ["BUZZ_ACP_JOB_DECISION_YIELD", "BUZZ_JOB_EVALUATION_ONLY"] {
+            assert!(!servers[0].env.iter().any(|entry| entry.name == name));
+        }
+
+        let later = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(channel),
+            Some("stream"),
+            None,
+            SessionCapabilityProfile::JobFollowupReadonly,
+            &["ef".repeat(32)],
+        );
+        assert_eq!(servers[0].name, later[0].name);
+        let env = |server: &McpServer| {
+            server
+                .env
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(env(&servers[0]), env(&later[0]));
+
+        let other_channel = Uuid::new_v4();
+        let other = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(other_channel),
+            Some("stream"),
+            None,
+            SessionCapabilityProfile::JobFollowupReadonly,
+            &reply_ids,
+        );
+        assert_ne!(servers[0].name, other[0].name);
+        assert_ne!(env(&servers[0]), env(&other[0]));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -8713,7 +8881,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8752,7 +8921,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8788,7 +8958,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8823,7 +8994,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8865,7 +9037,8 @@ exit 0"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -8994,7 +9167,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9067,7 +9241,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9124,7 +9299,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9168,7 +9344,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9211,7 +9388,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9279,7 +9457,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9318,7 +9497,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9393,7 +9573,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
@@ -9436,7 +9617,8 @@ done"#
                 id: None,
                 channel_type: None,
 
-                job_evaluation: false,
+                capability_profile: SessionCapabilityProfile::Ordinary,
+                followup_reply_event_ids: &[],
             },
         )
         .await
