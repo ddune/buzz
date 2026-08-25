@@ -9,10 +9,12 @@ use crate::managed_agents::{
     AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus, CommandAvailabilityInfo,
     HarnessSource,
 };
+mod adapter_probe;
 mod presets;
 mod runtime_metadata;
 #[macro_use]
 mod windows_install;
+pub(crate) use adapter_probe::codex_adapter_availability;
 pub(crate) use presets::{
     canonical_harness_command, command_for_runtime_id, preset_harness_definitions,
     preset_harness_ids,
@@ -599,6 +601,7 @@ fn clear_adapter_availability_cache() {
     if let Ok(mut guard) = adapter_availability_cache().lock() {
         *guard = None;
     }
+    adapter_probe::clear_cache();
 }
 
 /// Cache the current codex-acp adapter availability status.
@@ -1248,22 +1251,6 @@ pub(crate) fn probe_codex_acp_version_with_path(
         return None;
     }
     Some((major, minor, patch))
-}
-
-/// Classifies a resolved codex-acp binary path as [`AcpAvailabilityStatus::Available`]
-/// or [`AcpAvailabilityStatus::AdapterOutdated`].
-///
-/// The 0.16.x adapter (`@zed-industries/codex-acp`) does not recognise `--version`
-/// and exits non-zero — that probe failure yields `AdapterOutdated`. An adapter is
-/// available only when its version is at least [`MIN_CODEX_ACP_VERSION`].
-///
-/// Used by `discover_acp_runtimes`, `cli_login_requirements`, and
-/// `install_acp_runtime_blocking` so the version-gate logic is not duplicated.
-pub(crate) fn codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
-    match probe_codex_acp_version(path) {
-        Some(version) if version >= MIN_CODEX_ACP_VERSION => AcpAvailabilityStatus::Available,
-        _ => AcpAvailabilityStatus::AdapterOutdated,
-    }
 }
 
 /// Returns `true` when the codex-acp binary at `path` is below
