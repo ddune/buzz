@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
 use super::{
-    apply_agent_command_update, classify_runtime, codex_adapter_availability,
+    apply_agent_command_update, classify_runtime, clear_resolve_cache, codex_adapter_availability,
     codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
     effective_agent_command, find_nvm_default_bin, find_via_login_shell,
     is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
@@ -754,6 +754,94 @@ fn codex_adapter_availability_available_for_minimum_supported_binary() {
         status,
         AcpAvailabilityStatus::Available,
         "minimum supported adapter must classify as Available"
+    );
+}
+
+/// Concurrent managed-agent readiness checks for the same adapter must share
+/// one version probe. Running a Node-backed adapter once is cheap enough; a
+/// cold-start herd can push every subprocess past the bounded deadline.
+#[cfg(unix)]
+#[test]
+fn codex_adapter_availability_coalesces_concurrent_probes_for_one_path() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier};
+
+    let _guard = crate::managed_agents::lock_path_mutex();
+    clear_resolve_cache();
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = dir.path().join("codex-acp");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf 'probe\\n' >> \"$(dirname \"$0\")/probe-count\"\nsleep 1\necho '@agentclientprotocol/codex-acp 1.1.7'\nexit 0\n",
+    )
+    .expect("write script");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
+
+    let bin = Arc::new(bin);
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let bin = Arc::clone(&bin);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                codex_adapter_availability(bin.as_path())
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        assert_eq!(
+            handle.join().expect("readiness thread"),
+            AcpAvailabilityStatus::Available
+        );
+    }
+
+    let probe_count = std::fs::read_to_string(dir.path().join("probe-count"))
+        .expect("read probe count")
+        .lines()
+        .count();
+    assert_eq!(
+        probe_count, 1,
+        "concurrent readiness checks must execute one adapter probe"
+    );
+}
+
+/// A result for one resolved adapter path must never mask a different binary.
+#[cfg(unix)]
+#[test]
+fn codex_adapter_availability_keeps_distinct_paths_independent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = crate::managed_agents::lock_path_mutex();
+    clear_resolve_cache();
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let supported = dir.path().join("codex-acp-supported");
+    let outdated = dir.path().join("codex-acp-outdated");
+    std::fs::write(
+        &supported,
+        "#!/bin/sh\necho '@agentclientprotocol/codex-acp 1.1.7'\nexit 0\n",
+    )
+    .expect("write supported script");
+    std::fs::write(
+        &outdated,
+        "#!/bin/sh\necho '@agentclientprotocol/codex-acp 1.1.5'\nexit 0\n",
+    )
+    .expect("write outdated script");
+    std::fs::set_permissions(&supported, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod supported script");
+    std::fs::set_permissions(&outdated, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod outdated script");
+
+    assert_eq!(
+        codex_adapter_availability(&supported),
+        AcpAvailabilityStatus::Available
+    );
+    assert_eq!(
+        codex_adapter_availability(&outdated),
+        AcpAvailabilityStatus::AdapterOutdated
     );
 }
 

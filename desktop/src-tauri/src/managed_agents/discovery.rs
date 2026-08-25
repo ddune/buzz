@@ -595,9 +595,34 @@ fn adapter_availability_cache() -> &'static std::sync::Mutex<Option<AcpAvailabil
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
+/// Per-binary version-probe results for the current discovery generation.
+///
+/// Managed agents start concurrently, and each readiness check asks about the
+/// same adapter. Without single-flight caching, a cold desktop launch can run
+/// many Node-backed `codex-acp --version` processes at once. Those processes
+/// contend with each other, exceed the bounded probe deadline, and make a
+/// supported adapter look outdated. `OnceLock` lets one caller probe while
+/// peers for the same resolved path wait for and reuse that exact result.
+///
+/// The cache is cleared with the command-resolution cache after discovery or
+/// installation, so replacing the adapter causes the new binary to be probed.
+fn adapter_probe_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PathBuf, std::sync::Arc<OnceLock<AcpAvailabilityStatus>>>,
+> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<OnceLock<AcpAvailabilityStatus>>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn clear_adapter_availability_cache() {
     if let Ok(mut guard) = adapter_availability_cache().lock() {
         *guard = None;
+    }
+    if let Ok(mut guard) = adapter_probe_cache().lock() {
+        guard.clear();
     }
 }
 
@@ -1260,6 +1285,22 @@ pub(crate) fn probe_codex_acp_version_with_path(
 /// Used by `discover_acp_runtimes`, `cli_login_requirements`, and
 /// `install_acp_runtime_blocking` so the version-gate logic is not duplicated.
 pub(crate) fn codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
+    let probe_result = match adapter_probe_cache().lock() {
+        Ok(mut cache) => std::sync::Arc::clone(
+            cache
+                .entry(path.to_path_buf())
+                .or_insert_with(|| std::sync::Arc::new(OnceLock::new())),
+        ),
+        // A poisoned optimization cache must not prevent readiness evaluation.
+        Err(_) => return probe_codex_adapter_availability(path),
+    };
+
+    probe_result
+        .get_or_init(|| probe_codex_adapter_availability(path))
+        .clone()
+}
+
+fn probe_codex_adapter_availability(path: &Path) -> AcpAvailabilityStatus {
     match probe_codex_acp_version(path) {
         Some(version) if version >= MIN_CODEX_ACP_VERSION => AcpAvailabilityStatus::Available,
         _ => AcpAvailabilityStatus::AdapterOutdated,
